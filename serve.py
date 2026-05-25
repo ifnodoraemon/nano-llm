@@ -19,6 +19,7 @@ def generate_with_static_cache(
     model: Transformer,
     tokenizer,
     prompt: str,
+    pixel_values: torch.Tensor = None,
     max_new_tokens: int = 512,
     temperature: float = 0.7,
     top_k: int = 50,
@@ -62,7 +63,12 @@ def generate_with_static_cache(
     
     # Forward pass on the full prompt to populate the cache up to prompt_len
     # logits shape: (1, 1, vocab_size) - only output final token logits
-    logits, _ = model(x, start_pos=0, kv_caches=kv_caches)
+    if pixel_values is not None:
+        pixel_values_batch = pixel_values.unsqueeze(0).to(device)
+    else:
+        pixel_values_batch = None
+        
+    logits, _ = model(x, pixel_values=pixel_values_batch, start_pos=0, kv_caches=kv_caches)
     logits = logits[:, -1, :] # Select final step logits
     
     ttft = time.time() - start_time
@@ -90,8 +96,10 @@ def generate_with_static_cache(
     # --------------------------------------------------------------------------
     # We only feed the single newly sampled token (shape: 1, 1) rather than the growing history!
     curr_pos = prompt_len
+    if pixel_values is not None:
+        curr_pos += pixel_values.size(0)
     
-    decode_start_time = time.time()
+    decode_start_time = time.time();
     
     for _ in range(max_new_tokens - 1):
         if curr_pos >= model.config.block_size - 1:
@@ -151,6 +159,7 @@ def main():
     parser.add_argument("--max_new_tokens", type=int, default=256, help="Maximum generated tokens")
     parser.add_argument("--temperature", type=float, default=0.7, help="Generation diversity temperature")
     parser.add_argument("--top_k", type=int, default=50, help="Top-K tail filter limits")
+    parser.add_argument("--image", type=str, default=None, help="Optional image path or URL for multimodal VLM serving")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -171,11 +180,24 @@ def main():
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id or 0
         
+    # Process image if provided
+    if args.image is not None:
+        from utils.vision_helper import extract_image_features
+        pixel_values = extract_image_features(
+            image_path_or_url=args.image,
+            vision_dim=model_config.vision_dim or 1152,
+            num_patches=16,
+            device=device
+        )
+    else:
+        pixel_values = None
+        
     logger.info(f"🚀 Running high-performance static KV-cached autoregressive serving on {device}...")
     generate_with_static_cache(
         model=model,
         tokenizer=tokenizer,
         prompt=args.prompt,
+        pixel_values=pixel_values,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_k=args.top_k,
