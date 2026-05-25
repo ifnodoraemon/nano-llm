@@ -20,6 +20,8 @@ class ModelConfig:
     lora_alpha: float = 32.0    # LoRA alpha multiplier
     lora_dropout: float = 0.05  # LoRA dropout fraction
     vision_dim: Optional[int] = 1152 # Vision feature dim (SigLIP/ViT; None to disable VLM)
+    use_checkpoint: bool = False # Enable activation checkpointing for Billion-scale VRAM savings
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
@@ -338,7 +340,15 @@ class Transformer(nn.Module):
         # 3. Autoregressive multi-modal self-attention layers
         for idx, layer in enumerate(self.layers):
             layer_cache = kv_caches[idx] if kv_caches is not None else None
-            h = layer(h, freqs_cis, mask=None, start_pos=start_pos, kv_cache=layer_cache)
+            
+            if self.training and self.config.use_checkpoint:
+                from torch.utils.checkpoint import checkpoint
+                # Wrapper function matching checkpoint arguments rules (tensors only)
+                def custom_layer_forward(hidden_states, rope_freqs):
+                    return layer(hidden_states, rope_freqs, mask=None, start_pos=start_pos, kv_cache=layer_cache)
+                h = checkpoint(custom_layer_forward, h, freqs_cis, use_reentrant=False)
+            else:
+                h = layer(h, freqs_cis, mask=None, start_pos=start_pos, kv_cache=layer_cache)
             
         h = self.norm(h)
         
@@ -424,4 +434,41 @@ def convert_to_fp8(model: nn.Module):
             child.base_layer = FP8Linear(child.base_layer)
         else:
             convert_to_fp8(child)
+
+def get_preset_config(size: str = "7B", **kwargs) -> ModelConfig:
+    """
+    Returns pre-configured ModelConfig presets for standard Billion-scale architectures:
+    Presets include: '1.5B', '3B', and '7B' LLaMA layouts.
+    """
+    presets = {
+        "1.5B": {
+            "n_layer": 28,
+            "n_head": 16,
+            "n_embd": 2048,
+            "block_size": 2048,
+            "vocab_size": 32000
+        },
+        "3B": {
+            "n_layer": 32,
+            "n_head": 32,
+            "n_embd": 3072,
+            "block_size": 4096,
+            "vocab_size": 32000
+        },
+        "7B": {
+            "n_layer": 32,
+            "n_head": 32,
+            "n_embd": 4096,
+            "block_size": 4096,
+            "vocab_size": 32000
+        }
+    }
+    
+    if size not in presets:
+        raise ValueError(f"Unknown preset size: '{size}'. Available sizes: {list(presets.keys())}")
+        
+    config_dict = presets[size].copy()
+    config_dict.update(kwargs)
+    return ModelConfig(**config_dict)
+
 
