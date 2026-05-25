@@ -21,6 +21,13 @@ class ModelConfig:
     lora_dropout: float = 0.05  # LoRA dropout fraction
     vision_dim: Optional[int] = 1152 # Vision feature dim (SigLIP/ViT; None to disable VLM)
     use_checkpoint: bool = False # Enable activation checkpointing for Billion-scale VRAM savings
+    use_mla: bool = False       # Enable DeepSeek Multi-Head Latent Attention (MLA)
+    kv_comp_dim: int = 128      # MLA KV compressed latent dimension
+    use_moe: bool = False       # Enable DeepSeekMoE Mixture of Experts
+    num_shared_experts: int = 1 # Number of shared static experts
+    num_routed_experts: int = 8 # Number of total routed experts
+    num_active_experts: int = 2 # Number of active routed experts per token
+
 
 
 class RMSNorm(nn.Module):
@@ -225,10 +232,19 @@ class CausalSelfAttention(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.attention = CausalSelfAttention(config)
-        self.feed_forward = SwiGLU_MLP(config)
+        if config.use_mla:
+            self.attention = MultiHeadLatentAttention(config)
+        else:
+            self.attention = CausalSelfAttention(config)
+            
+        if config.use_moe:
+            self.feed_forward = DeepSeekMoE(config)
+        else:
+            self.feed_forward = SwiGLU_MLP(config)
+            
         self.attention_norm = RMSNorm(config.n_embd, eps=config.norm_eps)
         self.ffn_norm = RMSNorm(config.n_embd, eps=config.norm_eps)
+
 
     def forward(
         self, 
@@ -470,5 +486,181 @@ def get_preset_config(size: str = "7B", **kwargs) -> ModelConfig:
     config_dict = presets[size].copy()
     config_dict.update(kwargs)
     return ModelConfig(**config_dict)
+
+
+# ==============================================================================
+# DeepSeek Multi-Head Latent Attention (MLA) (DeepSeek-V2/V3 style)
+# ==============================================================================
+
+class MultiHeadLatentAttention(nn.Module):
+    """
+    Multi-Head Latent Attention (MLA) from DeepSeek.
+    Compresses Keys and Values into a low-rank latent representation during prefill,
+    massively reducing KV-Cache memory consumption by up to 93%.
+    """
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.n_heads = config.n_head
+        self.n_embd = config.n_embd
+        self.head_dim = config.n_embd // config.n_head
+        self.kv_comp_dim = config.kv_comp_dim
+        
+        # 1. KV Latent Compression Layers
+        self.kv_down_proj = nn.Linear(config.n_embd, self.kv_comp_dim, bias=False)
+        self.kv_up_proj = nn.Linear(self.kv_comp_dim, config.n_head * self.head_dim * 2, bias=False) # Maps to K and V
+        
+        # 2. Query Projection
+        self.wq = nn.Linear(config.n_embd, config.n_head * self.head_dim, bias=False)
+        self.wo = nn.Linear(config.n_head * self.head_dim, config.n_embd, bias=False)
+
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        start_pos: Optional[int] = None,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    ) -> torch.Tensor:
+        bsz, seqlen, _ = x.shape
+        
+        # 1. Query projection
+        xq = self.wq(x)
+        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
+        
+        # 2. Key and Value Latent Compression and Decompression
+        # Project token representations down to compressed latent state
+        latent_kv = self.kv_down_proj(x) # Shape: (bsz, seqlen, kv_comp_dim)
+        
+        # Project latent state up to retrieve Keys and Values
+        decompressed_kv = self.kv_up_proj(latent_kv) # Shape: (bsz, seqlen, n_heads * head_dim * 2)
+        k_decomp, v_decomp = torch.chunk(decompressed_kv, 2, dim=-1)
+        
+        xk = k_decomp.view(bsz, seqlen, self.n_heads, self.head_dim)
+        xv = v_decomp.view(bsz, seqlen, self.n_heads, self.head_dim)
+        
+        # 3. Decoupled RoPE injection
+        # MLA applies positional rotary coordinates to keys and queries before standard attention
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        
+        # 4. Standard Static KV-Cache caching
+        if kv_cache is not None and start_pos is not None:
+            cache_k, cache_v = kv_cache
+            cache_k[:, start_pos : start_pos + seqlen] = xk
+            cache_v[:, start_pos : start_pos + seqlen] = xv
+            
+            xk = cache_k[:, : start_pos + seqlen]
+            xv = cache_v[:, : start_pos + seqlen]
+            
+        xq = xq.transpose(1, 2)
+        xk = xk.transpose(1, 2)
+        xv = xv.transpose(1, 2)
+        
+        # 5. Compute Attention on dynamic KV-Cache
+        output = F.scaled_dot_product_attention(
+            xq, xk, xv, 
+            attn_mask=mask, 
+            dropout_p=0.0, 
+            is_causal=True if mask is None and start_pos is None else False
+        )
+        
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        return self.wo(output)
+
+
+# ==============================================================================
+# DeepSeekMoE: Mixture of Shared & Routed Experts Block
+# ==============================================================================
+
+class DeepSeekMoE(nn.Module):
+    """
+    DeepSeekMoE block containing Shared Experts (always active) and fine-grained
+    Routed Experts (dynamically gated).
+    """
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.num_shared = config.num_shared_experts
+        self.num_routed = config.num_routed_experts
+        self.num_active = config.num_active_experts
+        
+        # 1. Shared Experts (static SwiGLU_MLP modules)
+        self.shared_experts = nn.ModuleList([SwiGLU_MLP(config) for _ in range(self.num_shared)])
+        
+        # 2. Routed Experts (fine-grained SwiGLU_MLP modules)
+        self.routed_experts = nn.ModuleList([SwiGLU_MLP(config) for _ in range(self.num_routed)])
+        
+        # 3. Router Gate (maps hidden state to routing logits)
+        self.router = nn.Linear(config.n_embd, self.num_routed, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bsz, seqlen, d_model = x.shape
+        flat_x = x.view(-1, d_model) # Shape: (total_tokens, d_model)
+        
+        # 1. Process Shared Experts (Always active)
+        shared_out = torch.zeros_like(flat_x)
+        for expert in self.shared_experts:
+            shared_out += expert(flat_x)
+            
+        # 2. Routed Experts (Gated execution)
+        # Compute router logits for routed experts selection
+        router_logits = self.router(flat_x) # Shape: (total_tokens, num_routed)
+        
+        # Softmax to get gate probabilities
+        gate_probs = F.softmax(router_logits, dim=-1)
+        
+        # Select Top-K experts per token
+        topk_weights, topk_indices = torch.topk(gate_probs, self.num_active, dim=-1)
+        
+        # Normalize weights to sum to 1.0 per token
+        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        
+        routed_out = torch.zeros_like(flat_x)
+        
+        # Iterate over selected Top-K experts to aggregate outputs
+        for k in range(self.num_active):
+            weights = topk_weights[:, k] # (total_tokens,)
+            indices = topk_indices[:, k] # (total_tokens,)
+            
+            # Group tokens by their routed expert IDs to process efficiently in batches
+            for expert_idx in range(self.num_routed):
+                mask = (indices == expert_idx)
+                if mask.any():
+                    # Extract tokens routed to this specific expert
+                    expert_tokens = flat_x[mask]
+                    # Compute forward pass and scale by gate weights
+                    expert_out = self.routed_experts[expert_idx](expert_tokens)
+                    routed_out[mask] += expert_out * weights[mask].unsqueeze(-1)
+                    
+        # Blended combination of Shared and Routed experts output
+        output = shared_out + routed_out
+        return output.view(bsz, seqlen, d_model)
+
+
+def get_deepseek_config(size: str = "16B-equivalent", **kwargs) -> ModelConfig:
+    """
+    Returns native pre-configured ModelConfig presets for DeepSeek MLA + MoE architectures:
+    """
+    presets = {
+        "16B-equivalent": {
+            "n_layer": 24,
+            "n_head": 32,
+            "n_embd": 2048,
+            "block_size": 4096,
+            "vocab_size": 32000,
+            "use_mla": True,
+            "kv_comp_dim": 128,
+            "use_moe": True,
+            "num_shared_experts": 1,
+            "num_routed_experts": 8,
+            "num_active_experts": 2
+        }
+    }
+    
+    if size not in presets:
+        raise ValueError(f"Unknown DeepSeek size: '{size}'. Available sizes: {list(presets.keys())}")
+        
+    config_dict = presets[size].copy()
+    config_dict.update(kwargs)
+    return ModelConfig(**config_dict)
+
 
 

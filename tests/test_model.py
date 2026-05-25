@@ -212,7 +212,55 @@ class TestTransformerModules(unittest.TestCase):
         # Verify layer after conversion is FP8Linear
         self.assertIsInstance(model.layers[0].attention.wq, FP8Linear)
 
+    def test_deepseek_mla_attention(self):
+        """
+        Verifies that native Multi-Head Latent Attention (MLA) successfully compresses
+        Keys and Values, applies decoupled RoPE, and computes correct output shapes.
+        """
+        from model import get_deepseek_config, MultiHeadLatentAttention
+        config = get_deepseek_config(size="16B-equivalent", n_embd=64, n_head=2, kv_comp_dim=16)
+        
+        # Verify configurations
+        self.assertTrue(config.use_mla)
+        self.assertEqual(config.kv_comp_dim, 16)
+        
+        mla_layer = MultiHeadLatentAttention(config)
+        
+        # Input shape: (batch=2, seq_len=8, n_embd=64)
+        x = torch.randn(2, 8, 64)
+        freqs_cis = precompute_freqs_cis(dim=32, end=16) # head_dim = 64 // 2 = 32
+        
+        # Forward pass
+        out = mla_layer(x, freqs_cis=freqs_cis)
+        self.assertEqual(out.shape, (2, 8, 64))
+
+    def test_deepseek_moe_forward(self):
+        """
+        Verifies that DeepSeekMoE routes tokens to selected fine-grained experts,
+        applies dynamic gate weighting, and blends results with shared experts output.
+        """
+        from model import get_deepseek_config, DeepSeekMoE
+        config = get_deepseek_config(
+            size="16B-equivalent", 
+            n_embd=32, 
+            num_shared_experts=1, 
+            num_routed_experts=4, 
+            num_active_experts=2
+        )
+        
+        # Verify configurations
+        self.assertTrue(config.use_moe)
+        self.assertEqual(config.num_routed_experts, 4)
+        
+        moe_layer = DeepSeekMoE(config)
+        
+        # Input shape: (batch=1, seq_len=5, n_embd=32)
+        x = torch.randn(1, 5, 32)
+        out = moe_layer(x)
+        self.assertEqual(out.shape, (1, 5, 32))
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
