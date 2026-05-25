@@ -93,6 +93,23 @@ def get_status():
     return stats
 
 
+@app.get("/api/telemetry")
+def get_telemetry():
+    """Reads and returns real-time host and GPU telemetry stats."""
+    telemetry_path = "outputs/system_telemetry.json"
+    if os.path.exists(telemetry_path):
+        try:
+            with open(telemetry_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+            
+    # Fallback to direct reading if no file written yet
+    from utils.system_monitor import SystemMonitor
+    monitor = SystemMonitor()
+    return monitor.get_telemetry_report()
+
+
 @app.post("/api/data/download")
 def trigger_download():
     """Triggers the open-source dataset downloader and partitioner."""

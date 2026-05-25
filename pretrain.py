@@ -39,6 +39,14 @@ def main():
     from utils.system_monitor import SystemMonitor
     monitor = SystemMonitor()
 
+    # Dist environment auto-tuning
+    from utils.dist_helper import autotune_nccl
+    autotune_nccl()
+
+    from utils.checkpoint_saver import BackgroundCheckpointSaver, ElasticRestoreManager
+    saver = BackgroundCheckpointSaver()
+    restore_mgr = ElasticRestoreManager(args.out_dir)
+
     # 1. Initialize Distributed Data Parallel (DDP) environment
     ddp = "WORLD_SIZE" in os.environ
     if ddp:
@@ -141,6 +149,11 @@ def main():
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
 
+    # Auto-detect checkpoint to self-heal and hot-restore on failure
+    has_ckpt, restored_step, restored_epoch = restore_mgr.auto_detect_checkpoint()
+    if has_ckpt:
+        restored_step, _, _ = restore_mgr.restore_training_state(model, optimizer)
+
     # 6. Cosine learning rate scheduling calculator
     def get_lr(step):
         if step < args.warmup_steps:
@@ -155,6 +168,8 @@ def main():
     # 7. Pre-training Optimization Loop
     model.train()
     step = 0
+    if has_ckpt:
+        step = restored_step
     t0 = time.time()
 
     # Pre-calculate steps flops for real-time MFU reporting
@@ -240,6 +255,19 @@ def main():
             os.makedirs("outputs", exist_ok=True)
             with open("outputs/system_telemetry.json", "w") as f:
                 json.dump(monitor.get_telemetry_report(), f, indent=2)
+
+            # Non-blocking asynchronous checkpoint and manifest update every 50 steps
+            if (step + 1) % 50 == 0:
+                saver.save_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    lr_scheduler=None,
+                    config=config,
+                    step=step + 1,
+                    epoch=0,
+                    loss=loss_accum,
+                    out_dir=args.out_dir
+                )
 
         step += 1
 

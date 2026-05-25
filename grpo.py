@@ -390,6 +390,14 @@ def train():
     ddp_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     use_ddp = ddp_rank != -1
     
+    # Dist environment auto-tuning
+    from utils.dist_helper import autotune_nccl
+    autotune_nccl()
+
+    from utils.checkpoint_saver import BackgroundCheckpointSaver, ElasticRestoreManager
+    saver = BackgroundCheckpointSaver()
+    restore_mgr = ElasticRestoreManager(args.output_dir)
+
     if use_ddp:
         dist.init_process_group(backend="nccl")
         device = torch.device(f"cuda:{ddp_local_rank}")
@@ -442,6 +450,11 @@ def train():
     optim_groups = [p for p in policy_model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(optim_groups, lr=args.max_lr, weight_decay=0.01, fused=True)
 
+    # Auto-detect checkpoint to self-heal and hot-restore on failure
+    has_ckpt, restored_step, restored_epoch = restore_mgr.auto_detect_checkpoint()
+    if has_ckpt:
+        restored_step, restored_epoch, _ = restore_mgr.restore_training_state(policy_model, optimizer)
+
     # Loader setup
     dataset = GRPODataset(args.data_path, tokenizer, max_prompt_length=args.max_prompt_len)
     sampler = DistributedSampler(dataset, shuffle=True) if use_ddp else None
@@ -464,7 +477,11 @@ def train():
 
     # Training epochs loop
     step_idx = 0
-    for epoch in range(args.epochs):
+    start_epoch = 0
+    if has_ckpt:
+        step_idx = restored_step
+        start_epoch = restored_epoch
+    for epoch in range(start_epoch, args.epochs):
         if sampler:
             sampler.set_epoch(epoch)
             
@@ -604,6 +621,19 @@ def train():
                     os.makedirs("outputs", exist_ok=True)
                     with open("outputs/system_telemetry.json", "w") as f:
                         json.dump(monitor.get_telemetry_report(), f, indent=2)
+
+                    # Non-blocking asynchronous checkpoint and manifest update every 50 steps
+                    if (step_idx + 1) % 50 == 0:
+                        saver.save_checkpoint(
+                            model=policy_model,
+                            optimizer=optimizer,
+                            lr_scheduler=None,
+                            config=config,
+                            step=step_idx + 1,
+                            epoch=epoch,
+                            loss=total_loss * args.grad_accum_steps,
+                            out_dir=args.output_dir
+                        )
             
             step_idx += 1
             

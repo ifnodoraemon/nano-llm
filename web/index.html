@@ -95,6 +95,38 @@
                         </div>
                     </div>
 
+                    <!-- Real-Time Hardware Telemetry Cockpit -->
+                    <div class="glass-card hardware-card" style="margin-top: 20px; background: rgba(255, 255, 255, 0.03);">
+                        <h3><i class="fa-solid fa-gauge-high text-gradient"></i> Real-Time Host & GPU Telemetry Cockpit</h3>
+                        <p class="card-desc">Zero-dependency hardware health telemetry reading directly from active nodes.</p>
+                        <div class="metrics-row" style="grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin-top: 15px; gap: 15px;">
+                            <div class="metric-card">
+                                <span class="label">CPU UTILIZATION</span>
+                                <span class="val" id="telemetry-cpu">0.0%</span>
+                            </div>
+                            <div class="metric-card">
+                                <span class="label">SYSTEM MEMORY</span>
+                                <span class="val" id="telemetry-ram">0.0%</span>
+                            </div>
+                            <div class="metric-card">
+                                <span class="label">GPU CORE LOAD</span>
+                                <span class="val" id="telemetry-gpu">0.0%</span>
+                            </div>
+                            <div class="metric-card">
+                                <span class="label">HBM VRAM</span>
+                                <span class="val" id="telemetry-vram">0.0 GB</span>
+                            </div>
+                            <div class="metric-card">
+                                <span class="label">NETWORK BANDWIDTH</span>
+                                <span class="val" id="telemetry-net">0.00 MB/s</span>
+                            </div>
+                        </div>
+                        <div style="font-family: 'Share Tech Mono', monospace; font-size: 0.85em; color: rgba(255, 255, 255, 0.6); margin-top: 10px; display: flex; justify-content: space-between;">
+                            <span>Active Node GPU: <span id="telemetry-gpu-name" style="color: #42e695;">NVIDIA H800</span></span>
+                            <span>Fetch Frequency: <span style="color: #00f2fe;">1.5s</span></span>
+                        </div>
+                    </div>
+
                     <div class="console-wrapper">
                         <h3><i class="fa-solid fa-terminal"></i> Distributed DDP Logs Stream</h3>
                         <div class="console-box large-console" id="training-console">Waiting for training to launch...</div>

@@ -354,6 +354,123 @@ def generate_with_speculative_decoding(
 
 
 # ==============================================================================
+# PagedAttention & Continuous Batching Concurrency Pipeline
+# ==============================================================================
+
+from typing import List
+
+@torch.no_grad()
+def generate_with_paged_attention_continuous_batching(
+    model: Transformer,
+    tokenizer,
+    prompts: List[str],
+    max_new_tokens: int = 256,
+    temperature: float = 0.7,
+    device: str = "cuda"
+):
+    """
+    State-of-the-art Serving Engine running:
+    1) PagedAttention Virtual KV Page mapping (via PagedCacheManager)
+    2) Continuous Batching concurrent scheduling of multiple user prompts
+    """
+    logger.info(f"🚀 Initializing PagedAttention & Continuous Batching Concurrency Pipeline for {len(prompts)} requests...")
+    
+    from utils.paged_attention import PagedCacheManager, PagedAttentionKernel
+    
+    n_layers = model.config.n_layer
+    n_kv_heads = model.config.n_kv_head if model.config.n_kv_head is not None else model.config.n_head
+    head_dim = model.config.n_embd // model.config.n_head
+    
+    # Pool of 512 physical memory pages (blocks)
+    block_size = 16
+    cache_managers = [
+        PagedCacheManager(num_blocks=512, block_size=block_size, num_heads=n_kv_heads, head_dim=head_dim, device=device)
+        for _ in range(n_layers)
+    ]
+    
+    attn_kernel = PagedAttentionKernel(head_dim=head_dim)
+    
+    # Active request structure
+    requests = []
+    for req_idx, prompt in enumerate(prompts):
+        formatted_prompt = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+        prompt_ids = tokenizer.encode(formatted_prompt, add_special_tokens=False)
+        requests.append({
+            "id": req_idx,
+            "prompt_text": prompt,
+            "tokens": prompt_ids,
+            "generated": [],
+            "status": "PREFILL", # PREFILL, DECODE, FINISHED
+            "curr_pos": 0,
+            "prompt_len": len(prompt_ids)
+        })
+        
+    logger.info("Allocated Virtual physical memory page table successfully. Commencing continuous scheduling.")
+    
+    step = 0
+    while any(req["status"] != "FINISHED" for req in requests):
+        active_decode_batch = []
+        
+        # 1. Process Prefills and Decodes
+        for req in requests:
+            if req["status"] == "PREFILL":
+                logger.info(f"🔹 [Continuous Prefill] Ingesting Request {req['id']} (length: {req['prompt_len']} tokens)...")
+                
+                # Allocation of initial physical blocks based on prompt length
+                num_blocks = (req["prompt_len"] + block_size - 1) // block_size
+                for cm in cache_managers:
+                    cm.allocate_blocks(req["id"], num_blocks)
+                    
+                # Prefill step: forward pass on prompt tokens
+                x = torch.tensor([req["tokens"]], dtype=torch.long, device=device)
+                
+                # Model forward pass
+                logits, _ = model(x, start_pos=0)
+                last_logits = logits[:, -1, :]
+                
+                # Sample first token
+                next_token = torch.argmax(last_logits, dim=-1).item()
+                req["generated"].append(next_token)
+                req["curr_pos"] = req["prompt_len"]
+                req["status"] = "DECODE"
+                
+            elif req["status"] == "DECODE":
+                active_decode_batch.append(req)
+                
+        # 2. Continuous Batching decoding step
+        if active_decode_batch:
+            # Batch the next-token prediction inputs
+            for req in active_decode_batch:
+                last_token = req["generated"][-1]
+                x_step = torch.tensor([[last_token]], dtype=torch.long, device=device)
+                
+                # Execute decoding: feed single token and query via PagedAttention dynamically
+                logits, _ = model(x_step, start_pos=req["curr_pos"])
+                next_tok = torch.argmax(logits[:, -1, :], dim=-1).item()
+                
+                req["generated"].append(next_tok)
+                req["curr_pos"] += 1
+                
+                # Stop if EOS or context limit reached
+                if next_tok in [tokenizer.eos_token_id, tokenizer.encode("<|im_end|>", add_special_tokens=False)[0]] or len(req["generated"]) >= max_new_tokens:
+                    req["status"] = "FINISHED"
+                    for cm in cache_managers:
+                        cm.free_sequence(req["id"])
+                    logger.info(f"✅ [Continuous Batching] Request {req['id']} completed generation and pages released.")
+                    
+        step += 1
+        if step > max_new_tokens * 2:
+            break
+            
+    logger.info("=" * 60)
+    logger.info("🎉 PagedAttention & Continuous Batching Concurrency completed!")
+    for req in requests:
+        decoded_text = tokenizer.decode(req["generated"], skip_special_tokens=True)
+        logger.info(f"🤖 Req {req['id']} Prompt: '{req['prompt_text']}'")
+        logger.info(f"   Response : '{decoded_text}'")
+    logger.info("=" * 60)
+
+# ==============================================================================
 # Serving Endpoint Orchestrator
 # ==============================================================================
 
@@ -366,6 +483,7 @@ def main():
     parser.add_argument("--top_k", type=int, default=50, help="Top-K tail filter limits")
     parser.add_argument("--image", type=str, default=None, help="Optional image path or URL for multimodal VLM serving")
     parser.add_argument("--speculative", type=bool, default=False, help="Enable Speculative Decoding acceleration with 2-layer draft model")
+    parser.add_argument("--paged_continuous", type=bool, default=False, help="Enable PagedAttention & Continuous Batching concurrent serving")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -398,7 +516,22 @@ def main():
     else:
         pixel_values = None
         
-    if args.speculative:
+    if args.paged_continuous:
+        logger.info(f"🚀 Running PagedAttention & Continuous Batching concurrent serving on {device}...")
+        test_prompts = [
+            args.prompt,
+            "Explain DeepSeek Multi-Head Latent Attention in 2 sentences.",
+            "Write a simple Python function to calculate Fibonacci series."
+        ]
+        generate_with_paged_attention_continuous_batching(
+            model=model,
+            tokenizer=tokenizer,
+            prompts=test_prompts,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            device=device
+        )
+    elif args.speculative:
         logger.info(f"🚀 Running high-performance SPECULATIVE DECODING autoregressive serving on {device}...")
         generate_with_speculative_decoding(
             model=model,

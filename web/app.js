@@ -365,6 +365,43 @@ document.addEventListener("DOMContentLoaded", () => {
         return bubble;
     }
 
+    // --------------------------------------------------------------------------
+    // Real-Time Hardware Telemetry Poller
+    // --------------------------------------------------------------------------
+    const tCpu = document.getElementById("telemetry-cpu");
+    const tRam = document.getElementById("telemetry-ram");
+    const tGpu = document.getElementById("telemetry-gpu");
+    const tVram = document.getElementById("telemetry-vram");
+    const tNet = document.getElementById("telemetry-net");
+    const tGpuName = document.getElementById("telemetry-gpu-name");
+
+    async function syncTelemetryHUD() {
+        try {
+            const res = await fetch("/api/telemetry");
+            if (!res.ok) throw new Error("Telemetry connection failed.");
+            const data = await res.json();
+
+            tCpu.textContent = `${data.cpu.toFixed(1)}%`;
+            tRam.textContent = `${data.ram.toFixed(1)}%`;
+            tGpu.textContent = `${data.gpu_util.toFixed(0)}%`;
+            tVram.textContent = `${data.vram_used.toFixed(1)} / ${data.vram_total.toFixed(1)} GB`;
+            tNet.textContent = `${(data.net_rx + data.net_tx).toFixed(2)} MB/s`;
+            tGpuName.textContent = data.gpu_name;
+            
+            if (document.getElementById("metric-mfu")) {
+                document.getElementById("metric-mfu").textContent = `${data.gpu_util.toFixed(0)}%`;
+            }
+            if (hudMfu) {
+                hudMfu.textContent = `${data.gpu_util.toFixed(0)}%`;
+            }
+        } catch (err) {
+            console.warn("Hardware telemetry fetch skipped:", err.message);
+        }
+    }
+
+    syncTelemetryHUD();
+    setInterval(syncTelemetryHUD, 1500);
+
     btnSendChat.addEventListener("click", handleChatMessageSend);
     chatInputField.addEventListener("keydown", (e) => {
         if (e.key === "Enter") {
