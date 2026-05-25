@@ -2,12 +2,13 @@ import os
 import urllib.request
 import logging
 import argparse
+import json
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-# High-Quality Pre-training Dataset Puller & Sanitizer (Zero-Dependency)
+# 1. High-Quality Pre-training Dataset Puller & Sanitizer (Zero-Dependency)
 # ==============================================================================
 
 def download_and_setup_dataset(dest_dir: str):
@@ -39,12 +40,12 @@ def download_and_setup_dataset(dest_dir: str):
             with urllib.request.urlopen(req, timeout=15) as response:
                 content = response.read().decode("utf-8")
                 
-            # Basic text sanitization (remove WikiText head marks)
+            # Basic text sanitization (remove WikiText structural lines)
             lines = content.split("\n")
             sanitized_lines = []
             for line in lines:
                 line_str = line.strip()
-                if line_str and not line_str.startswith("="): # Filter structural headers
+                if line_str and not line_str.startswith("="): # Filter headers
                     sanitized_lines.append(line_str)
                     
             if len(sanitized_lines) > 10:
@@ -59,8 +60,6 @@ def download_and_setup_dataset(dest_dir: str):
             logger.warning(f"Failed to fetch {filename} over network: {e}")
             
     # 2. Local Fallback Generator
-    # If the environment is completely offline or network fails, we generate a high-quality 
-    # synthetic pre-training dataset covering LLMs, GPU architectures and Deep Learning!
     if downloaded_count == 0:
         logger.warning("Network fetching failed. Triggering high-quality offline corpus synthesizer...")
         
@@ -78,7 +77,6 @@ def download_and_setup_dataset(dest_dir: str):
         ]
         
         fallback_path = os.path.join(dest_dir, "offline_pretrain_corpus.txt")
-        # Scale the size of offline fallback dataset to make BPE tokenizer training stable
         expanded_corpus = []
         for i in range(150):
             expanded_corpus.append(f"Sample sentence sequence index {i}: " + offline_corpus[i % len(offline_corpus)])
@@ -93,9 +91,74 @@ def download_and_setup_dataset(dest_dir: str):
     logger.info(f"📂 Cleaned Corpus Destination: {dest_dir}")
     logger.info("=======================================================================")
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="nano-llm: zero-dependency open-source dataset downloader")
-    parser.add_argument("--dest_dir", type=str, default="./data/cleaned_corpus", help="Destination to save sanitized text files")
+
+# ==============================================================================
+# 2. Reasoning Prompt Seeds Generator for GRPO (DeepSeek-R1-Zero style)
+# ==============================================================================
+
+def generate_grpo_seed_dataset(dest_file: str, num_samples: int = 100):
+    """
+    Generates a premium, 100+ prompt reasoning seed file for GRPO training in JSONL format,
+    covering math arithmetic tasks, logic riddle tasks, and strict output formatting.
+    """
+    logger.info(f"Generating premium {num_samples} GRPO prompt reasoning seeds...")
+    
+    # 1. Base template configurations
+    math_operators = [("+", lambda x, y: x + y), ("-", lambda x, y: x - y), ("*", lambda x, y: x * y)]
+    prompts = []
+    
+    # Generate Math Prompt Seeds
+    for i in range(num_samples):
+        # Generate clean randomized arithmetic questions
+        op_name, op_func = math_operators[i % len(math_operators)]
+        val1 = (i * 3 + 7) % 50
+        val2 = (i * 2 + 5) % 30
+        
+        # Simple two-term calculation
+        question = f"Solve the mathematical equation: {val1} {op_name} {val2}."
+        answer = str(op_func(val1, val2))
+        
+        # Injects strict R1 tag instructions
+        prompt_seed = (
+            f"Question: {question} Think step-by-step. "
+            f"Wrap your step-by-step reasoning process inside <think>...</think> tags, "
+            f"and wrap your final correct number output inside <answer>...</answer> tags."
+        )
+        
+        prompts.append({
+            "prompt": prompt_seed,
+            "ground_truth": answer
+        })
+        
+    # Write to destination JSONL file
+    os.makedirs(os.path.dirname(dest_file), exist_ok=True)
+    with open(dest_file, "w", encoding="utf-8") as f:
+        for item in prompts:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+            
+    logger.info("=======================================================================")
+    logger.info("✅ GRPO Prompt Reasoning Seeds successfully synthesized!")
+    logger.info(f"📂 Destination File: {dest_file}")
+    logger.info(f"📝 Total Prompts: {len(prompts)} written.")
+    logger.info("=======================================================================")
+
+
+# ==============================================================================
+# 3. Main Orchestrator Execution
+# ==============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="nano-llm: zero-dependency open-source dataset downloader and generator")
+    parser.add_argument("--dest_dir", type=str, default="./data/cleaned_corpus", help="Destination to save sanitized pre-training text files")
+    parser.add_argument("--grpo_file", type=str, default="./data/train_grpo.jsonl", help="Destination to write GRPO prompt seeds")
+    parser.add_argument("--num_grpo", type=int, default=100, help="Number of GRPO prompt reasoning samples to synthesize")
     args = parser.parse_args()
     
-    download_and_setup_dataset(dest_dir=args.dest_dir)
+    # 1. Run Pre-training dataset puller
+    download_and_setup_dataset(args.dest_dir)
+    
+    # 2. Run GRPO Prompt Dataset generator
+    generate_grpo_seed_dataset(args.grpo_file, num_samples=args.num_grpo)
+
+if __name__ == "__main__":
+    main()

@@ -16,6 +16,8 @@ outputs_dpo/
 
 # Large binary token files and local data caches
 data/*.bin
+data/*.json
+data/*.jsonl
 data/raw_crawled/
 data/cleaned_corpus/
 
