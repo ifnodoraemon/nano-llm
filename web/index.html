@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>nano-llm: Autopilot Control Panel</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="glass-bg"></div>
+    <div class="app-container">
+        
+        <!-- Header -->
+        <header class="app-header">
+            <div class="logo">
+                <i class="fa-solid fa-microchip neon-glow-icon"></i>
+                <h1>NANO-LLM <span class="badge">VLM OS</span></h1>
+            </div>
+            <div class="live-hud">
+                <div class="hud-item"><span class="label">STATUS:</span> <span class="val green" id="hud-status">ONLINE</span></div>
+                <div class="hud-item"><span class="label">MFU:</span> <span class="val cyan" id="hud-mfu">0.0%</span></div>
+                <div class="hud-item"><span class="label">VOCAB:</span> <span class="val purple" id="hud-vocab">0</span></div>
+            </div>
+        </header>
+
+        <!-- Main Body Grid -->
+        <div class="main-layout">
+            
+            <!-- Sidebar Navigation -->
+            <nav class="sidebar">
+                <button class="nav-btn active" data-tab="data-hub"><i class="fa-solid fa-database"></i> Data Control</button>
+                <button class="nav-btn" data-tab="training"><i class="fa-solid fa-fire"></i> Training Cockpit</button>
+                <button class="nav-btn" data-tab="evaluation"><i class="fa-solid fa-trophy"></i> Leaderboard</button>
+                <button class="nav-btn" data-tab="chat"><i class="fa-solid fa-comments"></i> Chat Terminal</button>
+            </nav>
+
+            <!-- Content Area -->
+            <main class="content-panel">
+                
+                <!-- TAB 1: Data Control Room -->
+                <section class="tab-content active" id="data-hub">
+                    <h2><i class="fa-solid fa-database text-gradient"></i> Data Sourcing & Preprocessing</h2>
+                    <p class="section-desc">Acquire webpages, perform MinHash near-deduplication, train BPE tokenizers, and generate self-instruction datasets from scratch.</p>
+                    
+                    <div class="grid-2">
+                        <!-- Left: Core Actions -->
+                        <div class="glass-card">
+                            <h3><i class="fa-solid fa-gear"></i> Preprocessing Pipeline</h3>
+                            <div class="btn-list">
+                                <button class="action-btn" id="btn-download-dataset"><i class="fa-solid fa-cloud-arrow-down"></i> 0. Download Open-Source Dataset</button>
+                                <button class="action-btn" id="btn-crawl"><i class="fa-solid fa-spider"></i> 1. Scrape Raw HTML</button>
+                                <button class="action-btn" id="btn-dedup"><i class="fa-solid fa-filter"></i> 2. MinHash LSH Deduplication</button>
+                                <button class="action-btn" id="btn-tokenize"><i class="fa-solid fa-language"></i> 3. Train BPE Tokenizer</button>
+                                <button class="action-btn" id="btn-pack"><i class="fa-solid fa-file-export"></i> 4. Pack Token Binaries</button>
+                            </div>
+                        </div>
+
+                        <!-- Right: External API Self-Instruct -->
+                        <div class="glass-card boundary-glow">
+                            <h3><i class="fa-solid fa-brain"></i> Self-Instruction & LLM-as-a-Judge</h3>
+                            <p class="card-desc">Query external high-capability LLMs to synthesize diverse multi-turn dialogues and automatically score DPO preference pairs (Chosen vs Rejected).</p>
+                            <button class="action-btn purple-btn" id="btn-self-instruct"><i class="fa-solid fa-wand-magic-sparkles"></i> Synthesize SFT & DPO Data</button>
+                            <div class="console-box" id="data-console">System ready. Click pipeline steps above to proceed.</div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- TAB 2: Training Cockpit -->
+                <section class="tab-content" id="training">
+                    <h2><i class="fa-solid fa-fire text-gradient"></i> Multi-GPU Distributed Training</h2>
+                    <p class="section-desc">Launch parameter-efficient LoRA SFT and DPO alignment sharded across all 8 GPUs using PyTorch native DDP.</p>
+                    
+                    <div class="train-controls">
+                        <button class="action-btn cyan-btn" id="btn-start-pretrain"><i class="fa-solid fa-bolt"></i> Launch FP8 Pre-training</button>
+                        <button class="action-btn green-btn" id="btn-start-sft"><i class="fa-solid fa-play"></i> Launch LoRA SFT</button>
+                        <button class="action-btn purple-btn" id="btn-start-dpo"><i class="fa-solid fa-infinity"></i> Launch DPO Alignment</button>
+                    </div>
+
+
+                    <!-- Live Metrics Row -->
+                    <div class="metrics-row">
+                        <div class="metric-card">
+                            <span class="label">TRAINING LOSS</span>
+                            <span class="val" id="metric-loss">0.0000</span>
+                        </div>
+                        <div class="metric-card">
+                            <span class="label">LEARNING RATE</span>
+                            <span class="val" id="metric-lr">0.00e-0</span>
+                        </div>
+                        <div class="metric-card">
+                            <span class="label">MFU HARDWARE UTILIZATION</span>
+                            <span class="val" id="metric-mfu">0.0%</span>
+                        </div>
+                    </div>
+
+                    <div class="console-wrapper">
+                        <h3><i class="fa-solid fa-terminal"></i> Distributed DDP Logs Stream</h3>
+                        <div class="console-box large-console" id="training-console">Waiting for training to launch...</div>
+                    </div>
+                </section>
+
+                <!-- TAB 3: Leaderboard Benchmarks -->
+                <section class="tab-content" id="evaluation">
+                    <h2><i class="fa-solid fa-trophy text-gradient"></i> Leaderboard Benchmark testing</h2>
+                    <p class="section-desc">Verify your model's accuracy on MMLU multi-subject QA and GSM8K mathematical reasoning benchmarks.</p>
+                    
+                    <div class="btn-list inline-btn">
+                        <button class="action-btn cyan-btn" id="btn-run-eval"><i class="fa-solid fa-square-poll-vertical"></i> Execute Leaderboard Evaluations</button>
+                    </div>
+
+                    <div class="grid-2 eval-results-box">
+                        <!-- MMLU Gauge -->
+                        <div class="glass-card eval-card">
+                            <h3>MMLU (Multiple-Choice QA)</h3>
+                            <div class="gauge-container">
+                                <svg viewBox="0 0 100 50" class="gauge-svg">
+                                    <path class="gauge-bg" d="M 10 50 A 40 40 0 0 1 90 50" />
+                                    <path class="gauge-fill cyan-fill" id="mmlu-gauge" d="M 10 50 A 40 40 0 0 1 90 50" stroke-dasharray="0, 125.6" />
+                                </svg>
+                                <span class="gauge-value" id="val-mmlu">0%</span>
+                            </div>
+                        </div>
+
+                        <!-- GSM8K Gauge -->
+                        <div class="glass-card eval-card">
+                            <h3>GSM8K (Mathematical Reasoning)</h3>
+                            <div class="gauge-container">
+                                <svg viewBox="0 0 100 50" class="gauge-svg">
+                                    <path class="gauge-bg" d="M 10 50 A 40 40 0 0 1 90 50" />
+                                    <path class="gauge-fill purple-fill" id="gsm-gauge" d="M 10 50 A 40 40 0 0 1 90 50" stroke-dasharray="0, 125.6" />
+                                </svg>
+                                <span class="gauge-value" id="val-gsm">0%</span>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- TAB 4: Streaming Chat Terminal -->
+                <section class="tab-content" id="chat">
+                    <h2><i class="fa-solid fa-comments text-gradient"></i> KV-Cached Inference Terminal</h2>
+                    <p class="section-desc">Interact in real-time with your native Vision-Language model featuring high-throughput static KV-Cache acceleration.</p>
+                    
+                    <div class="chat-wrapper glass-card">
+                        <div class="chat-history" id="chat-history-box">
+                            <div class="chat-bubble assistant">
+                                <p>Hello! I am nano-llm. How can I help you today?</p>
+                            </div>
+                        </div>
+                        <div class="chat-input-bar">
+                            <input type="text" id="chat-input-field" placeholder="Ask nano-llm about programming, quantum physics, or vision projections...">
+                            <button class="chat-send-btn" id="btn-send-chat"><i class="fa-solid fa-paper-plane"></i></button>
+                        </div>
+                    </div>
+                </section>
+
+            </main>
+        </div>
+    </div>
+    
+    <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,23 @@
+# ==============================================================================
+# nano-llm: Minimal dependencies (Karpathy-style)
+# ==============================================================================
+
+# Core deep learning framework
+torch>=2.2.0
+
+# Base LLM weights loading, configs and tokenizer parsing
+transformers>=4.40.0
+sentencepiece
+tiktoken
+
+# Logging, visualizations and profiling
+wandb>=0.16.0
+tqdm
+packaging
+psutil
+
+# Web server and dashboard
+fastapi
+uvicorn
+pydantic
+

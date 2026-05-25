@@ -1,0 +1,29 @@
+# ==============================================================================
+# nano-llm: Git Ignore Configurations
+# ==============================================================================
+
+# Compiled python files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Checkpoints and models outputs
+outputs/
+outputs_dpo/
+*.pt
+*.pth
+
+# Large binary token files and local data caches
+data/*.bin
+data/raw_crawled/
+data/cleaned_corpus/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# System-specific ignores
+.DS_Store
+.ipynb_checkpoints/

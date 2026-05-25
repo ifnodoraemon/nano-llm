@@ -1,0 +1,40 @@
+version: '3.8'
+
+# ==============================================================================
+# nano-llm: High-Performance Multi-GPU Docker Compose Configuration
+# ==============================================================================
+
+services:
+  console-panel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nano_llm_dashboard
+    
+    # Mount the local folder to allow real-time code modifications without rebuilds
+    volumes:
+      - .:/workspace
+      
+    # Expose FastAPI Control panel
+    ports:
+      - "8000:8000"
+      
+    # Increase shared memory size (critical for multi-GPU NCCL inter-process communication)
+    shm_size: '16gb'
+    
+    # Configure complete NVIDIA pass-through for 8xH800 GPU cluster
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, utility]
+              
+    # Set GPU/CUDA variables
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_DEVICE_ORDER=PCI_BUS_ID
+      - OMP_NUM_THREADS=8
+      
+    restart: unless-stopped
