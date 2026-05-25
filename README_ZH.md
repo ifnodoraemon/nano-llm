@@ -35,6 +35,7 @@ graph TD
         E -->|pretrain.py + FP8 + NTK-RoPE| F["预训练基座权重 (checkpoint_pretrain.pt)"]
         F -->|train.py + SFT 样本打包| G["微调策略权重 (checkpoint_sft.pt)"]
         G -->|align.py + DPO 偏好学习| H["偏好对齐策略 (checkpoint_dpo.pt)"]
+        G -->|grpo.py + RLHF 推理对齐| I["推理策略权重 (checkpoint_grpo.pt)"]
     end
 
     %% 压缩与部署阶段
@@ -85,12 +86,14 @@ graph TD
     Root --> PRETRAIN["pretrain.py <br> (因果语言模型预训练循环)"]:::file
     Root --> TRAIN["train.py <br> (SFT 分布式多卡打包训练)"]:::file
     Root --> ALIGN["align.py <br> (DPO 分布式偏好对齐)"]:::file
+    Root --> GRPO["grpo.py <br> (DeepSeek-R1 GRPO 强化学习对齐)"]:::file
     Root --> SERVE["serve.py <br> (流式高吞吐 VLM 静态缓存推理服务)"]:::file
     
     %% 辅助模块
     Root --> UTILS["utils/"]:::dir
     Root --> WEB["web/"]:::dir
     Root --> DOCS["docs/"]:::dir
+    Root --> TESTS["tests/"]:::dir
     
     UTILS --> U1["download_dataset.py"]:::file
     UTILS --> U2["vision_helper.py"]:::file
@@ -103,6 +106,10 @@ graph TD
     DOCS --> DOC3["context_engineering.md"]:::file
     DOCS --> DOC4["performance_benchmarks.md"]:::file
     DOCS --> DOC5["risk_mitigation.md"]:::file
+
+    TESTS --> T1["test_model.py"]:::file
+    TESTS --> T2["test_data.py"]:::file
+    TESTS --> T3["test_grpo.py"]:::file
 ```
 
 ---
@@ -176,14 +183,15 @@ graph TD
     C2["2. DeepSeek MLA + DeepSeekMoE 架构<br>(model.py)"]:::comp
     C3["3. 动态 NTK-RoPE 1M 上下文 & FP8 计算<br>(pretrain.py / serve.py)"]:::comp
     C4["4. 拟物化反重力大模型控制台 HUD<br>(FastAPI 仪表盘)"]:::comp
+    C5["5. DeepSeek-R1 风格的 RLHF 与 GRPO 强化学习对齐<br>(grpo.py)"]:::comp
     
-    P1["5. DeepSeek-R1 风格的 RLHF 与 GRPO 强化学习对齐<br>(planned_grpo.py)"]:::active
-    P2["6. 3D 并行分布式切分训练 <br>(TP + PP + DP 混合并行)"]:::planned
-    P3["7. 高吞吐静态量化推理内核 <br>(TensorRT-LLM / vLLM hooks)"]:::planned
+    %% Planned milestones
+    P1["6. 3D 并行分布式切分训练 <br>(TP + PP + DP 混合并行)"]:::active
+    P2["7. 高吞吐静态量化推理内核 <br>(TensorRT-LLM / vLLM hooks)"]:::planned
     
-    C1 --> C2 --> C3 --> C4
-    C4 -->|当前研发重心| P1
-    P1 --> P2 --> P3
+    C1 --> C2 --> C3 --> C4 --> C5
+    C5 -->|当前研发重心| P1
+    P1 --> P2
 ```
 
 ---

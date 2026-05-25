@@ -35,6 +35,7 @@ graph TD
         E -->|pretrain.py + FP8 + NTK-RoPE| F["checkpoint_pretrain.pt (Pre-trained Base)"]
         F -->|train.py + SFT Packing| G["checkpoint_sft.pt (SFT Policy)"]
         G -->|align.py + DPO Preference| H["checkpoint_dpo.pt (Aligned Policy)"]
+        G -->|grpo.py + RLHF Reasoning| I["checkpoint_grpo.pt (Reasoning Policy)"]
     end
 
     %% Optimization & Deployment Phase
@@ -85,12 +86,14 @@ graph TD
     Root --> PRETRAIN["pretrain.py <br> (Causal Pre-training loop)"]:::file
     Root --> TRAIN["train.py <br> (DDP SFT Packing)"]:::file
     Root --> ALIGN["align.py <br> (DPO Alignment)"]:::file
+    Root --> GRPO["grpo.py <br> (DeepSeek-R1 GRPO RLHF loop)"]:::file
     Root --> SERVE["serve.py <br> (VLM static-cached streaming serving)"]:::file
     
     %% Subfolders
     Root --> UTILS["utils/"]:::dir
     Root --> WEB["web/"]:::dir
     Root --> DOCS["docs/"]:::dir
+    Root --> TESTS["tests/"]:::dir
     
     UTILS --> U1["download_dataset.py"]:::file
     UTILS --> U2["vision_helper.py"]:::file
@@ -103,6 +106,10 @@ graph TD
     DOCS --> DOC3["context_engineering.md"]:::file
     DOCS --> DOC4["performance_benchmarks.md"]:::file
     DOCS --> DOC5["risk_mitigation.md"]:::file
+
+    TESTS --> T1["test_model.py"]:::file
+    TESTS --> T2["test_data.py"]:::file
+    TESTS --> T3["test_grpo.py"]:::file
 ```
 
 ---
@@ -176,14 +183,15 @@ graph TD
     C2["2. DeepSeek MLA + DeepSeekMoE architectures<br>(model.py)"]:::comp
     C3["3. Dynamic NTK-RoPE 1M context & FP8 calculations<br>(pretrain.py / serve.py)"]:::comp
     C4["4. Interactive glassmorphic autopilot HUD<br>(FastAPI Control Panel)"]:::comp
+    C5["5. DeepSeek-R1 style RLHF & GRPO Alignment<br>(grpo.py)"]:::comp
     
-    P1["5. DeepSeek-R1 style RLHF & GRPO Alignment<br>(planned_grpo.py)"]:::active
-    P2["6. 3D Model Parallelism <br>(TP + PP + DP sharding setups)"]:::planned
-    P3["7. Quantized static serving kernels <br>(TensorRT-LLM / vLLM hooks)"]:::planned
+    %% Planned milestones
+    P1["6. 3D Model Parallelism <br>(TP + PP + DP sharding setups)"]:::active
+    P2["7. Quantized static serving kernels <br>(TensorRT-LLM / vLLM hooks)"]:::planned
     
-    C1 --> C2 --> C3 --> C4
-    C4 -->|Current Focus| P1
-    P1 --> P2 --> P3
+    C1 --> C2 --> C3 --> C4 --> C5
+    C5 -->|Current Focus| P1
+    P1 --> P2
 ```
 
 ---
