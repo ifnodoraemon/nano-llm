@@ -98,6 +98,7 @@ graph TD
     UTILS --> U1["download_dataset.py"]:::file
     UTILS --> U2["vision_helper.py"]:::file
     UTILS --> U3["upload_hub.py"]:::file
+    UTILS --> U4["hub_adapter.py"]:::file
     
     WEB --> W1["高端拟物玻璃化控制台前端 (FastAPI HUD)"]:::file
     
