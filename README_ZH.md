@@ -99,6 +99,11 @@ graph TD
     UTILS --> U2["vision_helper.py"]:::file
     UTILS --> U3["upload_hub.py"]:::file
     UTILS --> U4["hub_adapter.py"]:::file
+    UTILS --> U5["parallel_3d.py"]:::file
+    UTILS --> U6["paged_attention.py"]:::file
+    UTILS --> U7["audio_projection.py"]:::file
+    UTILS --> U8["grpo_critic.py"]:::file
+    UTILS --> U9["triton_fa3.py"]:::file
     
     WEB --> W1["高端拟物玻璃化控制台前端 (FastAPI HUD)"]:::file
     
@@ -111,6 +116,7 @@ graph TD
     TESTS --> T1["test_model.py"]:::file
     TESTS --> T2["test_data.py"]:::file
     TESTS --> T3["test_grpo.py"]:::file
+    TESTS --> T4["test_upgrades.py"]:::file
 ```
 
 ---
