@@ -403,8 +403,12 @@ def train():
         os.makedirs(args.output_dir, exist_ok=True)
         configure_logging(logging.INFO)
         logger.info("Initializing Group Relative Policy Optimization (GRPO)...")
+        # 0. Initialize hardware telemetry monitor
+        from utils.system_monitor import SystemMonitor
+        monitor = SystemMonitor()
     else:
         configure_logging(logging.ERROR)
+        monitor = None
 
     # Load Tokenizer
     tokenizer = AutoTokenizer.from_pretrained("gpt2")  # Fallback BPE tokenizer
@@ -581,13 +585,25 @@ def train():
                 current_beta = kl_tuner.tune_beta(mean_kl, current_beta)
                 
                 if is_master:
+                    telemetry_str = monitor.get_formatted_telemetry()
                     logger.info(
                         f"Step {step_idx + 1} | "
                         f"Loss: {total_loss * args.grad_accum_steps:.4f} | "
                         f"Mean Reward: {total_reward / micro_batch_size:.2f} | "
                         f"Mean KL: {total_kl / micro_batch_size:.4f} | "
-                        f"Adaptive Beta: {current_beta:.4f}"
+                        f"Adaptive Beta: {current_beta:.4f} | "
+                        f"{telemetry_str}"
                     )
+                    
+                    # Print detailed ASCII telemetry cockpit every 50 steps
+                    if (step_idx + 1) % 50 == 0:
+                        monitor.print_dashboard()
+                        
+                    # Save system telemetry to outputs directory
+                    import json
+                    os.makedirs("outputs", exist_ok=True)
+                    with open("outputs/system_telemetry.json", "w") as f:
+                        json.dump(monitor.get_telemetry_report(), f, indent=2)
             
             step_idx += 1
             

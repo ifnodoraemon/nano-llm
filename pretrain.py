@@ -35,6 +35,10 @@ def main():
     parser.add_argument("--out_dir", type=str, default="./outputs", help="Directory to save pre-trained checkpoints")
     args = parser.parse_args()
 
+    # 0. Initialize hardware telemetry monitor
+    from utils.system_monitor import SystemMonitor
+    monitor = SystemMonitor()
+
     # 1. Initialize Distributed Data Parallel (DDP) environment
     ddp = "WORLD_SIZE" in os.environ
     if ddp:
@@ -214,16 +218,28 @@ def main():
         mfu_percentage = min(100.0, max(0.0, mfu_percentage))
 
         if master_process:
+            telemetry_str = monitor.get_formatted_telemetry()
             logger.info(
                 f"Step {step+1}/{args.max_steps} | "
                 f"Loss: {loss_accum:.4f} | "
                 f"LR: {lr:.2e} | "
                 f"Time: {dt*1000:.1f}ms | "
-                f"MFU: {mfu_percentage:.1f}%"
+                f"MFU: {mfu_percentage:.1f}% | "
+                f"{telemetry_str}"
             )
+            
+            # Print detailed ASCII telemetry cockpit every 50 steps
+            if (step + 1) % 50 == 0:
+                monitor.print_dashboard()
             
             # Write structured JSON to stdout so FastAPI server captures step metrics
             print(f"METRICS_JSON: {{\"step\": {step+1}, \"loss\": {loss_accum:.4f}, \"lr\": {lr:.2e}, \"mfu\": {mfu_percentage:.1f}}}", flush=True)
+            
+            # Save system telemetry to outputs directory
+            import json
+            os.makedirs("outputs", exist_ok=True)
+            with open("outputs/system_telemetry.json", "w") as f:
+                json.dump(monitor.get_telemetry_report(), f, indent=2)
 
         step += 1
 
