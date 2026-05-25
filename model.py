@@ -27,6 +27,8 @@ class ModelConfig:
     num_shared_experts: int = 1 # Number of shared static experts
     num_routed_experts: int = 8 # Number of total routed experts
     num_active_experts: int = 2 # Number of active routed experts per token
+    rope_scaling: float = 1.0   # NTK-Aware RoPE scaling factor for 1M long-context extrapolation
+
 
 
 
@@ -105,7 +107,12 @@ class VisionProjection(nn.Module):
 # Rotary Position Embeddings (RoPE)
 # ==============================================================================
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, scaling_factor: float = 1.0) -> torch.Tensor:
+    # NTK-Aware RoPE Scaling: scale base theta dynamically based on scaling factor
+    # This prevents high-frequency loss during long-context extrapolation up to 1M tokens
+    if scaling_factor > 1.0:
+        theta = theta * (scaling_factor ** (dim / (dim - 2)))
+        
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)
     freqs = torch.outer(t, freqs).float()
@@ -284,7 +291,8 @@ class Transformer(nn.Module):
 
         self.freqs_cis = precompute_freqs_cis(
             dim=config.n_embd // config.n_head,
-            end=config.block_size * 2
+            end=config.block_size * 2,
+            scaling_factor=config.rope_scaling
         )
 
         self.apply(self._init_weights)
