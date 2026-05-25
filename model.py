@@ -28,6 +28,8 @@ class ModelConfig:
     num_routed_experts: int = 8 # Number of total routed experts
     num_active_experts: int = 2 # Number of active routed experts per token
     rope_scaling: float = 1.0   # NTK-Aware RoPE scaling factor for 1M long-context extrapolation
+    attn_scale_multiplier: float = 1.0 # Attention logits scaling multiplier to sharpen attention maps
+
 
 
 
@@ -181,6 +183,7 @@ class CausalSelfAttention(nn.Module):
         self.wk = get_linear(config.n_embd, self.n_kv_heads * self.head_dim)
         self.wv = get_linear(config.n_embd, self.n_kv_heads * self.head_dim)
         self.wo = get_linear(config.n_head * self.head_dim, config.n_embd)
+        self.attn_scale_multiplier = config.attn_scale_multiplier
 
     def repeat_kv(self, x: torch.Tensor, n_rep: int) -> torch.Tensor:
         if n_rep == 1:
@@ -225,11 +228,15 @@ class CausalSelfAttention(nn.Module):
         xk = xk.transpose(1, 2)
         xv = xv.transpose(1, 2)
         
+        # Multiply standard scaling by attn_scale_multiplier to sharpen/soften attention maps
+        custom_scale = (1.0 / math.sqrt(self.head_dim)) * self.attn_scale_multiplier
+        
         output = F.scaled_dot_product_attention(
             xq, xk, xv, 
             attn_mask=mask, 
             dropout_p=0.0, 
-            is_causal=True if mask is None and start_pos is None else False
+            is_causal=True if mask is None and start_pos is None else False,
+            scale=custom_scale
         )
         
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
@@ -520,6 +527,7 @@ class MultiHeadLatentAttention(nn.Module):
         # 2. Query Projection
         self.wq = nn.Linear(config.n_embd, config.n_head * self.head_dim, bias=False)
         self.wo = nn.Linear(config.n_head * self.head_dim, config.n_embd, bias=False)
+        self.attn_scale_multiplier = config.attn_scale_multiplier
 
     def forward(
         self, 
@@ -563,12 +571,16 @@ class MultiHeadLatentAttention(nn.Module):
         xk = xk.transpose(1, 2)
         xv = xv.transpose(1, 2)
         
+        # Multiply standard scaling by attn_scale_multiplier to sharpen/soften attention maps
+        custom_scale = (1.0 / math.sqrt(self.head_dim)) * self.attn_scale_multiplier
+        
         # 5. Compute Attention on dynamic KV-Cache
         output = F.scaled_dot_product_attention(
             xq, xk, xv, 
             attn_mask=mask, 
             dropout_p=0.0, 
-            is_causal=True if mask is None and start_pos is None else False
+            is_causal=True if mask is None and start_pos is None else False,
+            scale=custom_scale
         )
         
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
