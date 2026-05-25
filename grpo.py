@@ -307,11 +307,14 @@ def train():
     # Instantiate models
     # Policy model (Trainable)
     policy_model = Transformer(config).to(device)
-    policy_model.load_state_dict(checkpoint["model"])
+    model_state = checkpoint.get("model_state_dict", checkpoint.get("model", None))
+    if model_state is None:
+        raise KeyError("Could not locate model state dictionary in SFT checkpoint!")
+    policy_model.load_state_dict(model_state)
     
     # Reference model (Frozen baseline anchor)
     ref_model = Transformer(config).to(device)
-    ref_model.load_state_dict(checkpoint["model"])
+    ref_model.load_state_dict(model_state)
     ref_model.eval()
     for param in ref_model.parameters():
         param.requires_grad = False
