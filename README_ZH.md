@@ -104,6 +104,8 @@ graph TD
     UTILS --> U7["audio_projection.py"]:::file
     UTILS --> U8["grpo_critic.py"]:::file
     UTILS --> U9["triton_fa3.py"]:::file
+    UTILS --> U10["kv_eviction.py"]:::file
+    UTILS --> U11["search_tree.py"]:::file
     
     WEB --> W1["高端拟物玻璃化控制台前端 (FastAPI HUD)"]:::file
     
@@ -117,6 +119,7 @@ graph TD
     TESTS --> T2["test_data.py"]:::file
     TESTS --> T3["test_grpo.py"]:::file
     TESTS --> T4["test_upgrades.py"]:::file
+    TESTS --> T5["test_search_eviction.py"]:::file
 ```
 
 ---
