@@ -64,6 +64,8 @@ graph TD
 | 🏎️ **[性能指标与自我迭代蓝图](docs/performance_benchmarks.md)** | • 激活检查点（Activation Checkpointing）显存均摊流<br>• PyTorch FSDP 权重与优化器参数分布式切分状态<br>• Fused AdamW 硬件 CUDA 单扫（Single-Sweep）提速机制<br>• 自动化 Self-Play DPO 自我进化与对齐回路流程<br>• 多榜单评测（MMLU, GSM8K, ARC 等）提取与评分流程 |
 | 🛡️ **[LLM 训练风险与对齐规避蓝图](docs/risk_mitigation.md)** | • Loss 骤增与训练收敛崩盘的诱因与四重防御流图<br>• MoE 路由崩溃与专家闲置的动态门控均衡与共享专家保障<br>• DPO 偏好对齐奖励黑客与基于 Reference Anchor 的 KL 正则惩罚<br>• FP8 动态范围截断与溢出噪声的 Tensor-wise 动态比例映射 |
 | 🐳 **[Docker Swarm 多机部署与调度蓝图](docs/swarm_multi_node_deployment.md)** | • Swarm 管理节点与工作节点分布式拓扑图<br>• 节点标签设置与绕过容器虚拟化的 Host 网络映射<br>• PyTorch `torchrun` 跨多机环境变量配置与容器启动时序 |
+| 📡 **[阶段 3 集群遥测健康监控报告](file:///home/ifnodoraemon/.gemini/antigravity-cli/brain/b9731614-1ca7-4068-b098-e69f35aea81a/walkthrough_telemetry.md)** | • 零依赖 CPU/内存/网卡/NVIDIA GPU 指标读取<br>• 宿主机与容器内部完美一致的优雅降级与模拟 fallback<br>• Step logs 与 50 步 ASCII cockpit 仪表盘设计 |
+| 🚀 **[阶段 4 五大维度技术跃升报告](file:///home/ifnodoraemon/.gemini/antigravity-cli/brain/b9731614-1ca7-4068-b098-e69f35aea81a/walkthrough_stage4.md)** | • NCCL 拓扑多网卡自调优与 GPUDirect RDMA 参数配置<br>• 非阻塞异步 Checkpoint 守护线程写与弹性热重启恢复<br>• 工业级 MinHash-LSH 文档近似去重与高精 Heuristic 质量过滤<br>• PagedAttention & Continuous Batching 高并发并发 Serving 实现 |
 
 ---
 
