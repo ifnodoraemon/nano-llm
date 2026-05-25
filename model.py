@@ -415,43 +415,43 @@ class Transformer(nn.Module):
 
 class FP8Linear(nn.Module):
     """
-    Linear layer that performs forward pass in FP8 (e4m3) with dynamic scale factors.
-    Includes robust fallback for environments without CUDA/Hopper float8 support.
+    Linear layer that performs forward pass in FP8 (e4m3) with Channel-wise dynamic scale factors.
+    Optimized exclusively for Hopper H800 (Compute Capability >= 9.0).
     """
     def __init__(self, base_linear: nn.Linear):
         super().__init__()
         self.base_linear = base_linear
-        self.register_buffer("x_scale", torch.tensor(1.0))
-        self.register_buffer("w_scale", torch.tensor(1.0))
+        self.register_buffer("x_scale", None)
+        self.register_buffer("w_scale", None)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Check native Float8 support (requires PyTorch 2.1+, CUDA, and Compute Capability >= 8.9)
-        if (
-            hasattr(torch, "float8_e4m3fn") 
-            and x.is_cuda 
-            and torch.cuda.get_device_capability()[0] >= 9
-        ):
-            # Dynamic scaling factor calculation (Float8 max representation is 448.0)
-            with torch.no_grad():
-                x_max = x.abs().max()
-                w_max = self.base_linear.weight.abs().max()
-                self.x_scale.copy_(0.9 * self.x_scale + 0.1 * (448.0 / (x_max + 1e-5)))
-                self.w_scale.copy_(0.9 * self.w_scale + 0.1 * (448.0 / (w_max + 1e-5)))
-                
-            # Scale & Cast
-            x_fp8 = (x * self.x_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-            w_fp8 = (self.base_linear.weight * self.w_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        # 1. Dynamic scaling factor calculation (Float8 max is 448.0)
+        # Activation is scaled tensor-wide (scalar); weights are scaled channel-wise (per output channel)
+        with torch.no_grad():
+            x_max = x.abs().max()
+            w_max = self.base_linear.weight.abs().max(dim=1).values
             
-            # Compute MatMul and scale back
-            out = torch.matmul(x_fp8.to(torch.float32), w_fp8.to(torch.float32).t())
-            out = out / (self.x_scale * self.w_scale)
+            curr_x_scale = torch.tensor(448.0 / (x_max.item() + 1e-5), device=x.device)
+            curr_w_scale = 448.0 / (w_max + 1e-5)
             
-            if self.base_linear.bias is not None:
-                out = out + self.base_linear.bias.type_as(out)
-            return out.type_as(x)
-        else:
-            # CPU or older GPUs fallback: perform standard fp32/bf16 operations
-            return self.base_linear(x)
+            if self.x_scale is None:
+                self.register_buffer("x_scale", curr_x_scale)
+                self.register_buffer("w_scale", curr_w_scale)
+            else:
+                self.x_scale.copy_(0.9 * self.x_scale + 0.1 * curr_x_scale)
+                self.w_scale.copy_(0.9 * self.w_scale + 0.1 * curr_w_scale)
+            
+        # 2. Scale & Cast to Float8 e4m3
+        x_fp8 = (x * self.x_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        w_fp8 = (self.base_linear.weight * self.w_scale.unsqueeze(1)).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        
+        # 3. Compute MatMul and scale back channel-wise
+        out = torch.matmul(x_fp8.to(torch.float32), w_fp8.to(torch.float32).t())
+        out = out / (self.x_scale * self.w_scale.unsqueeze(0))
+        
+        if self.base_linear.bias is not None:
+            out = out + self.base_linear.bias.type_as(out)
+        return out.type_as(x)
 
 def convert_to_fp8(model: nn.Module):
     """
@@ -594,13 +594,15 @@ class MultiHeadLatentAttention(nn.Module):
 class DeepSeekMoE(nn.Module):
     """
     DeepSeekMoE block containing Shared Experts (always active) and fine-grained
-    Routed Experts (dynamically gated).
+    Routed Experts (dynamically gated). Incorporates Expert Capacity and dynamic 
+    Token Dropping to prevent communication load imbalance during distributed training.
     """
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, capacity_factor: float = 1.2):
         super().__init__()
         self.num_shared = config.num_shared_experts
         self.num_routed = config.num_routed_experts
         self.num_active = config.num_active_experts
+        self.capacity_factor = capacity_factor
         
         # 1. Shared Experts (static SwiGLU_MLP modules)
         self.shared_experts = nn.ModuleList([SwiGLU_MLP(config) for _ in range(self.num_shared)])
@@ -614,6 +616,7 @@ class DeepSeekMoE(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seqlen, d_model = x.shape
         flat_x = x.view(-1, d_model) # Shape: (total_tokens, d_model)
+        num_tokens = flat_x.size(0)
         
         # 1. Process Shared Experts (Always active)
         shared_out = torch.zeros_like(flat_x)
@@ -621,10 +624,7 @@ class DeepSeekMoE(nn.Module):
             shared_out += expert(flat_x)
             
         # 2. Routed Experts (Gated execution)
-        # Compute router logits for routed experts selection
         router_logits = self.router(flat_x) # Shape: (total_tokens, num_routed)
-        
-        # Softmax to get gate probabilities
         gate_probs = F.softmax(router_logits, dim=-1)
         
         # Select Top-K experts per token
@@ -633,23 +633,49 @@ class DeepSeekMoE(nn.Module):
         # Normalize weights to sum to 1.0 per token
         topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-8)
         
+        # 3. Expert Capacity Limits and Token Dropping
+        expert_capacity = int((num_tokens / self.num_routed) * self.capacity_factor)
+        expert_capacity = max(4, expert_capacity) # Ensure a baseline minimum capacity
+        
         routed_out = torch.zeros_like(flat_x)
         
-        # Iterate over selected Top-K experts to aggregate outputs
+        # Calculate load balancing auxiliary loss (Auxiliary loss) if in training
+        if self.training:
+            # Fraction of tokens dispatched to each expert
+            dispatched = torch.zeros(self.num_routed, device=x.device)
+            for k in range(self.num_active):
+                indices = topk_indices[:, k]
+                dispatched.scatter_add_(0, indices, torch.ones_like(indices, dtype=torch.float32))
+            fi = dispatched / num_tokens
+            pi = gate_probs.mean(dim=0)
+            aux_loss = self.num_routed * torch.sum(fi * pi)
+            # Store aux loss as buffer so parent block can access it
+            self.aux_loss = aux_loss
+            
+        # Run gated execution with capacity bounds
         for k in range(self.num_active):
             weights = topk_weights[:, k] # (total_tokens,)
             indices = topk_indices[:, k] # (total_tokens,)
             
-            # Group tokens by their routed expert IDs to process efficiently in batches
             for expert_idx in range(self.num_routed):
                 mask = (indices == expert_idx)
-                if mask.any():
-                    # Extract tokens routed to this specific expert
-                    expert_tokens = flat_x[mask]
-                    # Compute forward pass and scale by gate weights
-                    expert_out = self.routed_experts[expert_idx](expert_tokens)
-                    routed_out[mask] += expert_out * weights[mask].unsqueeze(-1)
-                    
+                token_indices = torch.where(mask)[0]
+                
+                if len(token_indices) > 0:
+                    # If exceeding capacity, drop tokens with lowest routing weights
+                    if len(token_indices) > expert_capacity:
+                        # Sort by weights and keep only the top capacity tokens
+                        active_weights = weights[token_indices]
+                        _, sorted_idx = torch.sort(active_weights, descending=True)
+                        keep_indices = token_indices[sorted_idx[:expert_capacity]]
+                    else:
+                        keep_indices = token_indices
+                        
+                    if len(keep_indices) > 0:
+                        expert_tokens = flat_x[keep_indices]
+                        expert_out = self.routed_experts[expert_idx](expert_tokens)
+                        routed_out[keep_indices] += expert_out * weights[keep_indices].unsqueeze(-1)
+                        
         # Blended combination of Shared and Routed experts output
         output = shared_out + routed_out
         return output.view(bsz, seqlen, d_model)

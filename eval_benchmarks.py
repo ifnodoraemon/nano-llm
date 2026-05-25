@@ -1,4 +1,5 @@
 import re
+import random
 import argparse
 import logging
 import torch
@@ -310,6 +311,92 @@ def evaluate_arena(
     }
 
 # ==============================================================================
+# 5. Automated Needle-in-a-Haystack (NIAH) Synthesized Context Evaluator
+# ==============================================================================
+
+class NeedleInAHaystackEvaluator:
+    """
+    Industry-standard Needle-in-a-Haystack (NIAH) benchmark synthetic generator.
+    Generates extremely long document contexts, inserts hidden facts at variable
+    depth percentiles, and scores model retrieval accuracy dynamically.
+    """
+    def __init__(self, context_lengths: list[int] = None, document_depths: list[float] = None):
+        self.context_lengths = context_lengths if context_lengths else [1024, 2048, 4096]
+        self.document_depths = document_depths if document_depths else [0.1, 0.5, 0.9] # 10%, 50%, 90% depth
+        
+    def generate_noise_context(self, target_word_count: int) -> str:
+        filler_sentences = [
+            "The quick brown fox jumps over the lazy dog.",
+            "Deep learning models require balanced multi-GPU clusters for high performance.",
+            "Rotary Position Embeddings stretch coordinates for extremely long sequences.",
+            "Multi-Head Latent Attention compresses KV-Cache sizes by up to 93%.",
+            "Continuous Batching schedules concurrent user queries token-by-token.",
+            "Asynchronous checkpoints write weights safely in background threads."
+        ]
+        text = ""
+        while len(text.split()) < target_word_count:
+            text += random.choice(filler_sentences) + " "
+        return text
+
+    def run_eval(self, model: Transformer, tokenizer, device: str = "cuda") -> dict:
+        logger.info(f"--- Running Needle-in-a-Haystack (NIAH) Evaluation ({len(self.context_lengths)} lengths x {len(self.document_depths)} depths) ---")
+        
+        results = {}
+        random.seed(1337)
+        
+        needle_value = "994285"
+        needle_sentence = f" The magic secret number key is: {needle_value}. Keep this key safe. "
+        question = "What is the magic secret number key? Respond with the number only wrapped inside <answer>...</answer> tags."
+        
+        for c_len in self.context_lengths:
+            for depth in self.document_depths:
+                logger.info(f"👉 Evaluating context_length={c_len} | needle_depth={depth*100:.0f}%...")
+                
+                noise = self.generate_noise_context(c_len)
+                words = noise.split()
+                
+                inject_idx = int(len(words) * depth)
+                words.insert(inject_idx, needle_sentence)
+                full_context = " ".join(words)
+                
+                prompt = f"Context: {full_context}\n\nQuestion: {question}"
+                formatted_prompt = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+                
+                input_ids = tokenizer.encode(formatted_prompt, add_special_tokens=False)
+                input_ids = input_ids[-model.config.block_size + 128:]
+                
+                generated_ids = list(input_ids)
+                for _ in range(64):
+                    active_x = torch.tensor([generated_ids[-model.config.block_size:]], dtype=torch.long, device=device)
+                    logits, _ = model(active_x)
+                    next_tok = torch.argmax(logits[0, -1, :]).item()
+                    generated_ids.append(next_tok)
+                    if next_tok in [tokenizer.eos_token_id, tokenizer.encode("<|im_end|>", add_special_tokens=False)[0]]:
+                        break
+                        
+                response = tokenizer.decode(generated_ids[len(input_ids):], skip_special_tokens=True)
+                
+                # Check for answer tags
+                pattern = r"<answer>(.*?)</answer>"
+                match = re.search(pattern, response, re.DOTALL)
+                extracted = match.group(1).strip() if match else ""
+                
+                if not extracted:
+                    is_correct = needle_value in response
+                else:
+                    is_correct = extracted == needle_value
+                    
+                score = 1.0 if is_correct else 0.0
+                results[f"{c_len}_{depth:.1f}"] = score
+                
+                logger.info(
+                    f"   [Result]: {'✅ FOUND' if is_correct else '❌ LOST'} | "
+                    f"Response: \"{response.strip()[:60]}...\""
+                )
+                
+        return results
+
+# ==============================================================================
 # Main Orchestrated Runner
 # ==============================================================================
 
@@ -369,6 +456,10 @@ def main():
     logger.info(f"🏆 Match Statistics: A Wins={arena_results['wins_a']} | B Wins={arena_results['wins_b']} | Ties={arena_results['ties']}")
     logger.info("=======================================================================")
     
+    # 4. Run Needle-in-a-Haystack Evaluator
+    niah_evaluator = NeedleInAHaystackEvaluator()
+    niah_results = niah_evaluator.run_eval(model, tokenizer, device=device)
+    
     # Save a JSON metric file for our Web Dashboard to read!
     import json
     report = {
@@ -379,7 +470,8 @@ def main():
         "arena_wins_b": arena_results["wins_b"],
         "arena_ties": arena_results["ties"],
         "arena_elo_a": arena_results["final_elo_a"],
-        "arena_elo_b": arena_results["final_elo_b"]
+        "arena_elo_b": arena_results["final_elo_b"],
+        "niah_results": niah_results
     }
     # Ensure outputs directory exists
     os.makedirs("./outputs", exist_ok=True)

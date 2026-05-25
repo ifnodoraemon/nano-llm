@@ -159,6 +159,8 @@ def evaluate_completion_rewards(
     3. Code Sandbox Reward: extracts and executes generated python code in a sandbox,
        adding rewards for successful compilation and correct logic, or penalizing errors.
     4. Length Regularization: penalizes infinite repetitive generations
+    5. Process-Supervised Reward Model (PRM) & Reward Clipping: scores intermediate
+       reasoning steps and penalizes repetitive loops (reward hacking), clamping final scores.
     """
     rewards = []
     sandbox = SandboxCodeExecutor(timeout=2.0)
@@ -206,9 +208,38 @@ def evaluate_completion_rewards(
         if comp_len > 1500 or comp_len < 10:
             reward -= 0.5
             
+        # E. Process-Supervised Reward Model (PRM) Step-Scoring & Reward Hacking Prevention
+        think_match = re.search(r"<think>(.*?)</think>", completion, re.DOTALL)
+        if think_match:
+            think_text = think_match.group(1).strip()
+            
+            # Analyze reasoning steps and transitions (e.g. Step 1, Step 2, Therefore, So, etc.)
+            steps = re.findall(r"(?:Step\s*\d+|therefore|so,|hence|thus|because|firstly|secondly|let's|wait|check)", think_text, re.IGNORECASE)
+            num_steps = len(steps)
+            if num_steps >= 3:
+                reward += 0.5  # Strong step-by-step thinking transitions
+            elif num_steps >= 1:
+                reward += 0.2  # Simple reasoning indicators
+                
+            # Repetitive / Chaotic reasoning loop check
+            words = think_text.lower().split()
+            if len(words) > 10:
+                unique_words = set(words)
+                repetition_ratio = 1.0 - (len(unique_words) / len(words))
+                if repetition_ratio > 0.4:
+                    reward -= 0.8  # Penalize high repetition within thinking block (preventing repetitive loop hacking)
+                    
+                # Check for line-level repetitive patterns
+                lines = [line.strip() for line in think_text.split('\n') if line.strip()]
+                if len(lines) > 2:
+                    consecutive_dups = sum(1 for idx in range(len(lines) - 1) if lines[idx] == lines[idx + 1])
+                    if consecutive_dups >= 2:
+                        reward -= 1.0  # Penalize duplicate line cycles
+                        
         rewards.append(reward)
         
-    return torch.tensor(rewards, dtype=torch.float32)
+    rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
+    return torch.clamp(rewards_tensor, min=-3.0, max=3.0)
 
 
 # ==============================================================================
