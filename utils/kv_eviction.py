@@ -98,3 +98,43 @@ class H2OKVCacheEvictor:
             
         # Reshape to standard 4D tensor format
         return torch.stack(compressed_k), torch.stack(compressed_v)
+
+
+class StreamingLLMEvictor:
+    """
+    StreamingLLM KV-Cache Eviction Manager.
+    Allows infinite-length context serving by keeping absolute sinks and a local sliding window.
+    """
+    def __init__(self, num_sinks: int = 4, recent_window: int = 508):
+        self.num_sinks = num_sinks
+        self.recent_window = recent_window
+        self.max_cache_size = num_sinks + recent_window
+
+    def evict_kv_cache(
+        self, 
+        k_cache: torch.Tensor, 
+        v_cache: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compresses Key-Value cache tensors dynamically based on StreamingLLM window logic.
+        k_cache / v_cache shapes: [Batch, Num_heads, Seq_len, Head_dim]
+        """
+        batch_size, num_heads, seq_len, head_dim = k_cache.shape
+        device = k_cache.device
+        
+        if seq_len <= self.max_cache_size:
+            return k_cache, v_cache
+            
+        # Extract sink tokens (first num_sinks positions)
+        k_sinks = k_cache[:, :, :self.num_sinks, :]
+        v_sinks = v_cache[:, :, :self.num_sinks, :]
+        
+        # Extract sliding window tokens (last recent_window positions)
+        k_window = k_cache[:, :, seq_len - self.recent_window:, :]
+        v_window = v_cache[:, :, seq_len - self.recent_window:, :]
+        
+        # Concatenate sinks and window
+        compressed_k = torch.cat([k_sinks, k_window], dim=2)
+        compressed_v = torch.cat([v_sinks, v_window], dim=2)
+        
+        return compressed_k, compressed_v

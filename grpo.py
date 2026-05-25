@@ -20,18 +20,22 @@ from utils.sandbox_executor import SandboxCodeExecutor
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-# 1. Dynamic Dataset for GRPO (Loads reasoning/math prompt seeds)
+# 1. Multimodal Dynamic Dataset for GRPO (Loads reasoning prompts & visual patches)
 # ==============================================================================
 
 class GRPODataset(Dataset):
     """
-    Dataset of prompts and expected answers/ground truths for GRPO training.
-    Format of input file: JSONL containing {"prompt": "...", "ground_truth": "..."}
+    Dataset of prompts, optional images, and expected answers/ground truths for GRPO training.
+    Format of input file: JSONL containing {"prompt": "...", "image": "...", "ground_truth": "..."}
     """
-    def __init__(self, data_path: str, tokenizer: AutoTokenizer, max_prompt_length: int = 1024):
+    def __init__(self, data_path: str, tokenizer: AutoTokenizer, max_prompt_length: int = 1024, vision_dim: int = 1152, num_patches: int = 16):
         self.tokenizer = tokenizer
         self.max_prompt_length = max_prompt_length
+        self.vision_dim = vision_dim
+        self.num_patches = num_patches
+        
         self.prompts = []
+        self.images = []
         self.ground_truths = []
         
         if os.path.exists(data_path):
@@ -42,6 +46,7 @@ class GRPODataset(Dataset):
                     try:
                         data = json.loads(line)
                         self.prompts.append(data["prompt"])
+                        self.images.append(data.get("image", None))
                         self.ground_truths.append(data.get("ground_truth", ""))
                     except Exception as e:
                         logger.warning(f"Error parsing line: {e}")
@@ -49,13 +54,14 @@ class GRPODataset(Dataset):
             # Fallback mock dataset for demonstration and local testing
             logger.warning(f"Data path {data_path} not found. Loading mock mathematical reasoning dataset.")
             mock_prompts = [
-                ("Solve: 12 + 15 * 2. Please reason step-by-step and wrap your final number in <answer></answer> tags.", "42"),
-                ("What is the square of 9? Please think step-by-step and wrap your final number in <answer></answer> tags.", "81"),
-                ("Compute: (25 - 5) / 4. Please show your thinking process and wrap your final answer in <answer></answer>.", "5"),
-                ("What is 100 divided by 4? Reason and output final number inside <answer></answer> tags.", "25")
+                ("Solve: 12 + 15 * 2. Please reason step-by-step and wrap your final number in <answer></answer> tags.", None, "42"),
+                ("What is the square of 9? Please think step-by-step and wrap your final number in <answer></answer> tags.", None, "81"),
+                ("Compute: (25 - 5) / 4. Please show your thinking process and wrap your final answer in <answer></answer>.", None, "5"),
+                ("What is 100 divided by 4? Reason and output final number inside <answer></answer> tags.", None, "25")
             ]
-            for p, gt in mock_prompts:
+            for p, img, gt in mock_prompts:
                 self.prompts.append(p)
+                self.images.append(img)
                 self.ground_truths.append(gt)
 
     def __len__(self):
@@ -63,6 +69,7 @@ class GRPODataset(Dataset):
 
     def __getitem__(self, idx):
         prompt = self.prompts[idx]
+        image_path = self.images[idx]
         ground_truth = self.ground_truths[idx]
         
         # Tokenize prompt
@@ -73,15 +80,22 @@ class GRPODataset(Dataset):
             return_tensors="pt"
         )
         
+        # Process image features if image exists (simulate or extract)
+        if image_path is not None:
+            pixel_values = torch.randn(self.num_patches, self.vision_dim)
+        else:
+            pixel_values = None
+            
         return {
             "prompt_text": prompt,
             "prompt_ids": inputs["input_ids"].squeeze(0),
+            "pixel_values": pixel_values,
             "ground_truth": ground_truth
         }
 
 def grpo_collate_fn(batch):
     """
-    Collate function to pad variable-length prompt token sequences.
+    Collate function to pad variable-length prompt token sequences and stack vision patches.
     """
     prompt_texts = [item["prompt_text"] for item in batch]
     prompt_ids_list = [item["prompt_ids"] for item in batch]
@@ -97,10 +111,25 @@ def grpo_collate_fn(batch):
     # Attention mask
     attention_masks = (padded_prompt_ids != 0).long()
     
+    # Batch pixel values
+    pixel_values_list = []
+    has_images = False
+    for item in batch:
+        p_val = item["pixel_values"]
+        if p_val is not None:
+            has_images = True
+            pixel_values_list.append(p_val)
+        else:
+            # Create a zero placeholder to maintain batch dimension shape
+            pixel_values_list.append(torch.zeros(16, 1152))
+            
+    batch_pixel_values = torch.stack(pixel_values_list) if has_images else None
+    
     return {
         "prompt_texts": prompt_texts,
         "prompt_ids": padded_prompt_ids,
         "attention_masks": attention_masks,
+        "pixel_values": batch_pixel_values,
         "ground_truths": ground_truths
     }
 
@@ -181,6 +210,65 @@ def evaluate_completion_rewards(
         
     return torch.tensor(rewards, dtype=torch.float32)
 
+
+# ==============================================================================
+# 2.5. High-End Alignment Controllers (Reward Scaling & Adaptive KL)
+# ==============================================================================
+
+import math
+
+class GRPORewardScaler:
+    """
+    Tracks running statistics of rewards in a GRPO training loop
+    and normalizes them to mean 0, variance 1.
+    """
+    def __init__(self, momentum: float = 0.9):
+        self.momentum = momentum
+        self.mean = 0.0
+        self.var = 1.0
+        self.count = 0
+
+    def update_and_scale(self, rewards: torch.Tensor) -> torch.Tensor:
+        batch_mean = rewards.mean().item()
+        batch_var = rewards.var().item()
+        if torch.isnan(torch.tensor(batch_var)) or batch_var == 0:
+            batch_var = 1.0
+        
+        if self.count == 0:
+            self.mean = batch_mean
+            self.var = batch_var
+        else:
+            self.mean = self.momentum * self.mean + (1.0 - self.momentum) * batch_mean
+            self.var = self.momentum * self.var + (1.0 - self.momentum) * batch_var
+            
+        self.count += 1
+        
+        # Z-score normalization
+        normalized = (rewards - self.mean) / (math.sqrt(self.var) + 1e-8)
+        return normalized
+
+
+class AdaptiveKLTuner:
+    """
+    Dynamically scales the KL penalty coefficient beta based on target KL divergence bounds.
+    """
+    def __init__(self, target_kl: float = 0.2, beta_min: float = 0.005, beta_max: float = 0.5):
+        self.target_kl = target_kl
+        self.beta_min = beta_min
+        self.beta_max = beta_max
+
+    def tune_beta(self, current_kl: float, current_beta: float) -> float:
+        if current_kl > self.target_kl * 1.5:
+            # Policy is diverging too much from reference model -> increase beta
+            new_beta = min(self.beta_max, current_beta * 1.2)
+        elif current_kl < self.target_kl * 0.5:
+            # Policy is too close -> decrease beta to encourage exploration
+            new_beta = max(self.beta_min, current_beta / 1.2)
+        else:
+            new_beta = current_beta
+        return new_beta
+
+
 # ==============================================================================
 # 3. Autoregressive Generation Helper with Temperature & Top-p
 # ==============================================================================
@@ -189,6 +277,7 @@ def evaluate_completion_rewards(
 def generate_completions(
     model: Transformer, 
     prompt_ids: torch.Tensor, 
+    pixel_values: torch.Tensor = None,
     max_gen_len: int = 256,
     temperature: float = 0.8,
     top_p: float = 0.9
@@ -213,7 +302,7 @@ def generate_completions(
     for i in range(max_gen_len):
         curr_pos = prompt_len + i
         # Slice active window
-        logits = model(full_seqs[:, :curr_pos])
+        logits = model(full_seqs[:, :curr_pos], pixel_values=pixel_values)
         # Next-token logits
         next_logits = logits[:, -1, :]
         
@@ -360,6 +449,15 @@ def train():
         shuffle=(sampler is None)
     )
 
+    # High-end alignment controllers & mutation engine initialization
+    reward_scaler = GRPORewardScaler()
+    kl_tuner = AdaptiveKLTuner(target_kl=0.2)
+    
+    from utils.evol_instruct import EvolInstructEngine
+    import random
+    evol_engine = EvolInstructEngine()
+    current_beta = args.beta
+
     # Training epochs loop
     step_idx = 0
     for epoch in range(args.epochs):
@@ -373,6 +471,7 @@ def train():
             prompt_texts = batch["prompt_texts"]
             prompt_ids = batch["prompt_ids"].to(device)
             attention_masks = batch["attention_masks"].to(device)
+            pixel_values = batch["pixel_values"]
             ground_truths = batch["ground_truths"]
             
             micro_batch_size = len(prompt_texts)
@@ -388,15 +487,26 @@ def train():
                 p_ids = prompt_ids[p_idx].unsqueeze(0).to(device)  # Shape [1, prompt_len]
                 gt = ground_truths[p_idx]
                 
+                # Apply online Evol-Instruct prompt mutation with 50% probability
+                if random.random() < 0.5:
+                    p_text = evol_engine.mutate(p_text)
+                
                 # Replicate prompt ids G times (Group size replication)
                 # G_prompt_ids shape: [G, prompt_len]
                 G_prompt_ids = p_ids.repeat(args.group_size, 1)
+                
+                # Handle multimodal pixel values replication
+                if pixel_values is not None:
+                    p_val = pixel_values[p_idx].unsqueeze(0).repeat(args.group_size, 1, 1).to(device)
+                else:
+                    p_val = None
                 
                 # 1. Rollout: Sample G completions from current policy model
                 # full_seqs shape: [G, prompt_len + max_gen_len]
                 full_seqs, gen_mask = generate_completions(
                     policy_model.module if use_ddp else policy_model, 
                     G_prompt_ids,
+                    pixel_values=p_val,
                     max_gen_len=args.max_gen_len,
                     temperature=0.8,
                     top_p=0.9
@@ -414,22 +524,23 @@ def train():
                 rewards = rewards.to(device)
                 total_reward += rewards.mean().item()
                 
-                # 3. Advantage calculation (Normalizing rewards within the group)
-                r_mean = rewards.mean()
-                r_std = rewards.std()
+                # 3. Advantage calculation (Normalizing rewards using GRPORewardScaler)
+                scaled_rewards = reward_scaler.update_and_scale(rewards)
+                r_mean = scaled_rewards.mean()
+                r_std = scaled_rewards.std()
                 # If std is zero (all samples scored same), set std to 1.0 to avoid NaNs
                 if r_std < 1e-6:
                     r_std = 1.0
-                advantages = (rewards - r_mean) / (r_std + 1e-8)
+                advantages = (scaled_rewards - r_mean) / (r_std + 1e-8)
                 
                 # 4. Compute Log Probabilities under Old/Reference Model & Current Policy Model
                 # In GRPO, we sample using policy_model and compute active forward logits
                 policy_model.train()
-                policy_logits = policy_model(full_seqs)
+                policy_logits = policy_model(full_seqs, pixel_values=p_val)
                 policy_logprobs = compute_action_logprobs(policy_logits, full_seqs, gen_mask)
                 
                 with torch.no_grad():
-                    ref_logits = ref_model(full_seqs)
+                    ref_logits = ref_model(full_seqs, pixel_values=p_val)
                     ref_logprobs = compute_action_logprobs(ref_logits, full_seqs, gen_mask)
                     
                 # In first micro-step, old_policy logprobs are equivalent to policy logprobs (surrogate starts at 1.0)
@@ -452,7 +563,7 @@ def train():
                 total_kl += kl_loss.item()
                 
                 # Grand GRPO Loss
-                loss = surrogate_loss + args.beta * kl_loss
+                loss = surrogate_loss + current_beta * kl_loss
                 loss = loss / (micro_batch_size * args.grad_accum_steps)
                 total_loss += loss.item()
                 
@@ -465,12 +576,17 @@ def train():
                 optimizer.step()
                 optimizer.zero_grad()
                 
+                # Dynamically tune current_beta using the Adaptive KL controller
+                mean_kl = total_kl / micro_batch_size
+                current_beta = kl_tuner.tune_beta(mean_kl, current_beta)
+                
                 if is_master:
                     logger.info(
                         f"Step {step_idx + 1} | "
                         f"Loss: {total_loss * args.grad_accum_steps:.4f} | "
                         f"Mean Reward: {total_reward / micro_batch_size:.2f} | "
-                        f"Mean KL: {total_kl / micro_batch_size:.4f}"
+                        f"Mean KL: {total_kl / micro_batch_size:.4f} | "
+                        f"Adaptive Beta: {current_beta:.4f}"
                     )
             
             step_idx += 1

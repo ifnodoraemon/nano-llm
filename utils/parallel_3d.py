@@ -200,3 +200,101 @@ class PipelineParallelTransformer(nn.Module):
         if self.current_rank == self.num_stages - 1:
             x = self.head(x)
         return x
+
+
+class ZeRO3Sharder:
+    """
+    Conceptual Zero Redundancy Optimizer Stage 3 (ZeRO-3) Parameter Sharder.
+    Partitions model parameters across distributed data parallel (DDP) ranks.
+    Dynamically all-gathers full parameters in-flight during forward/backward steps,
+    and scatters them immediately afterwards to conserve high-bandwidth memory (HBM).
+    """
+    def __init__(self, model: nn.Module, world_size: int = 1, rank: int = 0):
+        self.model = model
+        self.world_size = world_size
+        self.rank = rank
+        self.sharded_params = {}
+        
+        if world_size > 1:
+            self._shard_model_parameters()
+
+    def _shard_model_parameters(self):
+        """
+        Splits all model parameters into 1/world_size slices per rank.
+        """
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+                
+            # Keep only the sharded slice on current rank HBM
+            original_shape = param.shape
+            flat_param = param.data.view(-1)
+            total_elements = flat_param.numel()
+            
+            # Pad if not evenly divisible
+            padded_size = ((total_elements + self.world_size - 1) // self.world_size) * self.world_size
+            if padded_size > total_elements:
+                padding = torch.zeros(padded_size - total_elements, device=param.device, dtype=param.dtype)
+                flat_param = torch.cat([flat_param, padding])
+                
+            local_size = padded_size // self.world_size
+            local_start = self.rank * local_size
+            local_end = local_start + local_size
+            
+            # Extract current rank slice
+            sharded_data = flat_param[local_start:local_end].clone()
+            
+            # Store metadata for dynamic gathering
+            self.sharded_params[name] = {
+                "sharded_data": sharded_data,
+                "original_shape": original_shape,
+                "original_numel": total_elements,
+                "padded_size": padded_size
+            }
+            
+            # Replace active parameter data with local slice to save memory
+            param.data = sharded_data
+            logger_msg = f"Sharded param '{name}': original shape {original_shape} -> local shape {sharded_data.shape}"
+            print(logger_msg)
+
+    def gather_parameter(self, name: str) -> torch.Tensor:
+        """
+        Gathers sharded slices across all ranks to reconstruct the original full parameter.
+        """
+        if self.world_size <= 1 or name not in self.sharded_params:
+            for p_name, p in self.model.named_parameters():
+                if p_name == name:
+                    return p.data
+            return None
+            
+        meta = self.sharded_params[name]
+        sharded_data = meta["sharded_data"].to(torch.cuda.current_device() if torch.cuda.is_available() else "cpu")
+        
+        # Output placeholder for gathered flat tensor
+        gathered_flat = torch.empty(meta["padded_size"], device=sharded_data.device, dtype=sharded_data.dtype)
+        
+        # Trigger All-Gather collective
+        if dist.is_initialized():
+            # Split placeholder into slice list for all-gather
+            slice_list = list(gathered_flat.chunk(self.world_size))
+            dist.all_gather(slice_list, sharded_data)
+        else:
+            # Fallback for non-distributed dry run
+            gathered_flat = sharded_data.repeat(self.world_size)
+            
+        # Un-pad and restore original shape
+        full_data = gathered_flat[:meta["original_numel"]].view(meta["original_shape"])
+        return full_data
+
+    def scatter_parameter(self, name: str, param: nn.Parameter):
+        """
+        Re-slices and releases gathered parameters to free GPU memory.
+        """
+        if self.world_size <= 1 or name not in self.sharded_params:
+            return
+            
+        meta = self.sharded_params[name]
+        # Re-assign parameter data to only hold sharded slice
+        param.data = meta["sharded_data"]
+        # Force garbage collector to release full gathered tensor
+        torch.cuda.empty_cache()

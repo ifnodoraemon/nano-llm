@@ -99,12 +99,24 @@ def generate_with_static_cache(
     if pixel_values is not None:
         curr_pos += pixel_values.size(0)
     
+    from utils.kv_eviction import StreamingLLMEvictor
+    evictor = StreamingLLMEvictor(num_sinks=4, recent_window=256)
+    
     decode_start_time = time.time();
     
     for _ in range(max_new_tokens - 1):
         if curr_pos >= model.config.block_size - 1:
             logger.warning("Context block limit reached. Terminating generation.")
             break
+            
+        # StreamingLLM KV-Cache Eviction: Keep sinks and sliding window in-place
+        if curr_pos >= evictor.max_cache_size - 1:
+            for k_cache, v_cache in kv_caches:
+                k_cache[:, evictor.num_sinks : evictor.max_cache_size - 1, :, :] = \
+                    k_cache[:, curr_pos - evictor.recent_window + 1 : curr_pos, :, :]
+                v_cache[:, evictor.num_sinks : evictor.max_cache_size - 1, :, :] = \
+                    v_cache[:, curr_pos - evictor.recent_window + 1 : curr_pos, :, :]
+            curr_pos = evictor.max_cache_size - 1
             
         # Feed ONLY the single new token!
         x_step = next_token
@@ -247,6 +259,9 @@ def generate_with_speculative_decoding(
     if pixel_values is not None:
         curr_pos += pixel_values.size(0)
         
+    from utils.kv_eviction import StreamingLLMEvictor
+    evictor = StreamingLLMEvictor(num_sinks=4, recent_window=256)
+        
     decode_start_time = time.time()
     
     K = 4 # Speculative lookahead window size
@@ -255,6 +270,21 @@ def generate_with_speculative_decoding(
         if curr_pos + K >= model.config.block_size - 1:
             logger.warning("Context window bounds reached. Exiting decoding.")
             break
+            
+        # StreamingLLM KV-Cache Eviction for BOTH target and draft models
+        if curr_pos >= evictor.max_cache_size - 1:
+            for k_cache, v_cache in target_caches:
+                k_cache[:, evictor.num_sinks : evictor.max_cache_size - 1, :, :] = \
+                    k_cache[:, curr_pos - evictor.recent_window + 1 : curr_pos, :, :]
+                v_cache[:, evictor.num_sinks : evictor.max_cache_size - 1, :, :] = \
+                    v_cache[:, curr_pos - evictor.recent_window + 1 : curr_pos, :, :]
+            
+            for k_cache, v_cache in draft_caches:
+                k_cache[:, evictor.num_sinks : evictor.max_cache_size - 1, :, :] = \
+                    k_cache[:, curr_pos - evictor.recent_window + 1 : curr_pos, :, :]
+                v_cache[:, evictor.num_sinks : evictor.max_cache_size - 1, :, :] = \
+                    v_cache[:, curr_pos - evictor.recent_window + 1 : curr_pos, :, :]
+            curr_pos = evictor.max_cache_size - 1
             
         # 1. Draft model generates K tokens greedily (using its own KV-cache)
         draft_tokens = []
