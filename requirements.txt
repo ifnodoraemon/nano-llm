@@ -21,3 +21,8 @@ fastapi
 uvicorn
 pydantic
 
+# Model Hubs and Publishing
+huggingface_hub
+modelscope
+
+
