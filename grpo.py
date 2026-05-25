@@ -15,6 +15,7 @@ from transformers import AutoTokenizer
 
 from model import ModelConfig, Transformer
 from utils.model_utils import configure_logging, count_parameters
+from utils.sandbox_executor import SandboxCodeExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -126,9 +127,13 @@ def evaluate_completion_rewards(
     Calculates rewards for a group of completions.
     1. Format Reward: checks if output contains <think>...</think> and <answer>...</answer>
     2. Math Reward: checks if the extracted answer matches the ground truth
-    3. Length Regularization: penalizes infinite repetitive generations
+    3. Code Sandbox Reward: extracts and executes generated python code in a sandbox,
+       adding rewards for successful compilation and correct logic, or penalizing errors.
+    4. Length Regularization: penalizes infinite repetitive generations
     """
     rewards = []
+    sandbox = SandboxCodeExecutor(timeout=2.0)
+    
     for prompt, completion, gt in zip(prompts, completions, ground_truths):
         reward = 0.0
         
@@ -149,7 +154,25 @@ def evaluate_completion_rewards(
             elif extracted in gt or gt in extracted:
                 reward += 0.5  # Substring partial match
                 
-        # C. Repetitive/Length Penalty: Penalize excessively verbose or empty generations
+        # C. Code Sandbox Reward: If completion contains code, execute and verify it
+        extracted_code = sandbox.extract_code(completion)
+        if extracted_code:
+            # Execute in sandbox
+            res = sandbox.execute_and_verify(extracted_code)
+            if res["success"]:
+                reward += 1.0  # Code successfully compiled and exited 0!
+                
+                # Check if code output matches ground truth (for coding questions)
+                stdout = res["stdout"].strip()
+                if gt and stdout == gt.strip():
+                    reward += 1.5  # Code executed and matched the ground truth answer!
+                elif gt and (gt.strip() in stdout or stdout in gt.strip()):
+                    reward += 0.5  # Substring match on execution output
+            else:
+                # Syntax error, runtime error, security exception, or timeout
+                reward -= 0.5  # Code failed execution or violated security bounds
+                
+        # D. Repetitive/Length Penalty: Penalize excessively verbose or empty generations
         comp_len = len(completion)
         if comp_len > 1500 or comp_len < 10:
             reward -= 0.5

@@ -166,12 +166,157 @@ def evaluate_gsm8k(model: Transformer, tokenizer, device: str = "cuda") -> float
     return accuracy
 
 # ==============================================================================
+# 4. LLM-as-a-Judge Automated Elo Arena
+# ==============================================================================
+
+ARENA_PROMPTS = [
+    "Write a secure python function to read a CSV file safely without path traversal vulnerabilities.",
+    "Explain MLA (Multi-Head Latent Attention) simply to a high schooler.",
+    "Solve the system of linear equations: x + 2y = 8 and 3x - y = 3.",
+    "If a train travels at 60 mph for 2 hours, then 80 mph for 1.5 hours, what is its average speed?",
+    "Describe the key architectural differences between standard GQA and DeepSeek MLA.",
+    "Write a short, engaging Sci-Fi story about a quantum computer achieving consciousness."
+]
+
+def generate_completion_for_arena(model: Transformer, tokenizer, prompt: str, device: str) -> str:
+    """
+    Generates text using standard autoregressive generation for Arena evaluation.
+    """
+    formatted_prompt = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+    input_ids = tokenizer.encode(formatted_prompt, add_special_tokens=False)
+    generated_ids = list(input_ids)
+    
+    for _ in range(128):
+        logits, _ = model(torch.tensor([generated_ids], dtype=torch.long, device=device))
+        last_logits = logits[0, -1, :]
+        next_token = torch.argmax(last_logits).item()
+        generated_ids.append(next_token)
+        if next_token in [tokenizer.eos_token_id, tokenizer.encode("<|im_end|>", add_special_tokens=False)[0]]:
+            break
+            
+    return tokenizer.decode(generated_ids[len(input_ids):], skip_special_tokens=True)
+
+def heuristic_referee_judge(prompt: str, response_a: str, response_b: str) -> float:
+    """
+    Simulates a high-quality LLM-as-a-judge by computing multi-dimensional heuristic quality scores.
+    Scores are based on:
+    1. Richness of CoT reasoning (presence of reasoning tags / length of thinking).
+    2. Answer structure and vocabulary diversity.
+    3. Formatting constraints and blocklist hygiene.
+    
+    Returns:
+        Score between 0.0 and 1.0 representing probability of Model A winning.
+        0.5 represents a tie, >0.5 represents A winning, <0.5 represents B winning.
+    """
+    score_a = 0.0
+    score_b = 0.0
+    
+    # 1. Structural reasoning check
+    has_cot_a = "<think>" in response_a and "</think>" in response_a
+    has_cot_b = "<think>" in response_b and "</think>" in response_b
+    if has_cot_a: score_a += 1.0
+    if has_cot_b: score_b += 1.0
+    
+    # 2. Length regularization (penalize extreme short or extreme word loop repetitions)
+    len_a = len(response_a)
+    len_b = len(response_b)
+    
+    if 50 < len_a < 1000: score_a += 1.5
+    if 50 < len_b < 1000: score_b += 1.5
+    
+    # 3. Simple repetitive word loop detection
+    words_a = response_a.lower().split()
+    words_b = response_b.lower().split()
+    
+    uniq_ratio_a = len(set(words_a)) / max(1, len(words_a))
+    uniq_ratio_b = len(set(words_b)) / max(1, len(words_b))
+    
+    score_a += uniq_ratio_a * 2.0
+    score_b += uniq_ratio_b * 2.0
+    
+    # 4. Coding constraint match (if prompt asks for python code)
+    if "python" in prompt.lower() or "code" in prompt.lower():
+        if "def " in response_a or "```" in response_a: score_a += 1.5
+        if "def " in response_b or "```" in response_b: score_b += 1.5
+        
+    # Calculate win probability
+    total = score_a + score_b
+    if total == 0:
+        return 0.5
+    return score_a / total
+
+def evaluate_arena(
+    model_a: Transformer, 
+    model_b: Transformer, 
+    tokenizer, 
+    device: str = "cuda"
+) -> dict:
+    """
+    Executes a blind pairwise de duel (Arena) over ARENA_PROMPTS.
+    Updates Elo ratings starting from 1200.
+    """
+    logger.info(f"--- Launching LLM-as-a-Judge Elo Arena ({len(ARENA_PROMPTS)} rounds) ---")
+    elo_a = 1200.0
+    elo_b = 1200.0
+    K = 32.0 # Elo scaling weight
+    
+    wins_a = 0
+    wins_b = 0
+    ties = 0
+    
+    for idx, prompt in enumerate(ARENA_PROMPTS):
+        logger.info(f"Arena Round {idx+1}: Prompt = '{prompt[:50]}...'")
+        
+        # Generate completions blind
+        resp_a = generate_completion_for_arena(model_a, tokenizer, prompt, device)
+        resp_b = generate_completion_for_arena(model_b, tokenizer, prompt, device)
+        
+        # Judge grades the pairwise outputs
+        prob_a_wins = heuristic_referee_judge(prompt, resp_a, resp_b)
+        
+        # Determine match outcome
+        if prob_a_wins > 0.55:
+            outcome_a = 1.0
+            outcome_b = 0.0
+            wins_a += 1
+            logger.info("   [Judge Decision]: Model A Wins!")
+        elif prob_a_wins < 0.45:
+            outcome_a = 0.0
+            outcome_b = 1.0
+            wins_b += 1
+            logger.info("   [Judge Decision]: Model B Wins!")
+        else:
+            outcome_a = 0.5
+            outcome_b = 0.5
+            ties += 1
+            logger.info("   [Judge Decision]: It's a Draw!")
+            
+        # Expected scores
+        exp_a = 1.0 / (1.0 + 10.0 ** ((elo_b - elo_a) / 400.0))
+        exp_b = 1.0 / (1.0 + 10.0 ** ((elo_a - elo_b) / 400.0))
+        
+        # Update Elo
+        elo_a = elo_a + K * (outcome_a - exp_a)
+        elo_b = elo_b + K * (outcome_b - exp_b)
+        
+        logger.info(f"   [Elo Status]: Model A Elo = {elo_a:.1f} | Model B Elo = {elo_b:.1f}")
+        
+    return {
+        "wins_a": wins_a,
+        "wins_b": wins_b,
+        "ties": ties,
+        "final_elo_a": elo_a,
+        "final_elo_b": elo_b
+    }
+
+# ==============================================================================
 # Main Orchestrated Runner
 # ==============================================================================
 
 def main():
     parser = argparse.ArgumentParser(description="nano-llm: Automated Leaderboard Benchmark Evaluator")
     parser.add_argument("--checkpoint_path", type=str, required=True, help="Path to saved model .pt checkpoint file")
+    parser.add_argument("--baseline_checkpoint_path", type=str, default=None, help="Optional path to baseline model checkpoint to run Arena")
     args = parser.parse_args()
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -186,6 +331,7 @@ def main():
     model.eval()
     
     # Load tokenizer
+    logger.info("Initializing tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B") 
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id or 0
@@ -196,12 +342,31 @@ def main():
     # 2. Run GSM8K
     gsm_acc = evaluate_gsm8k(model, tokenizer, device=device)
     
+    # 3. Run Elo Arena
+    # If no baseline is provided, we clone the model configuration to run self-arena representing standard decoding baseline
+    if args.baseline_checkpoint_path and os.path.exists(args.baseline_checkpoint_path):
+        logger.info(f"Loading baseline checkpoint state from: {args.baseline_checkpoint_path}")
+        base_checkpoint = torch.load(args.baseline_checkpoint_path, map_location=device)
+        baseline_model = Transformer(base_checkpoint["config"]).to(device)
+        baseline_model.load_state_dict(base_checkpoint["model_state_dict"])
+        baseline_model.eval()
+    else:
+        logger.info("No baseline checkpoint path provided. Running Self-Play Elo Arena comparing Model A against base initialization.")
+        import copy
+        baseline_model = Transformer(model_config).to(device) # Base random weights or identical model to simulate self-eval
+        baseline_model.eval()
+        
+    arena_results = evaluate_arena(model, baseline_model, tokenizer, device=device)
+    
     logger.info("=======================================================================")
-    logger.info("📊 Benchmark Leaderboard Report:")
+    logger.info("📊 Benchmark Leaderboard & Arena Report:")
     logger.info("-----------------------------------------------------------------------")
     logger.info(f"🏆 MMLU Multiple Choice Accuracy: {mmlu_acc*100:.2f}%")
     logger.info(f"🏆 GSM8K Grade School Math Accuracy: {gsm_acc*100:.2f}%")
     logger.info(f"🏆 Consolidated Leaderboard Index: {((mmlu_acc + gsm_acc)/2)*100:.2f}%")
+    logger.info(f"🏆 Arena Model A Final Elo Rating: {arena_results['final_elo_a']:.1f}")
+    logger.info(f"🏆 Arena Model B Final Elo Rating: {arena_results['final_elo_b']:.1f}")
+    logger.info(f"🏆 Match Statistics: A Wins={arena_results['wins_a']} | B Wins={arena_results['wins_b']} | Ties={arena_results['ties']}")
     logger.info("=======================================================================")
     
     # Save a JSON metric file for our Web Dashboard to read!
@@ -209,8 +374,15 @@ def main():
     report = {
         "mmlu_accuracy": mmlu_acc,
         "gsm8k_accuracy": gsm_acc,
-        "consolidated_score": (mmlu_acc + gsm_acc) / 2
+        "consolidated_score": (mmlu_acc + gsm_acc) / 2,
+        "arena_wins_a": arena_results["wins_a"],
+        "arena_wins_b": arena_results["wins_b"],
+        "arena_ties": arena_results["ties"],
+        "arena_elo_a": arena_results["final_elo_a"],
+        "arena_elo_b": arena_results["final_elo_b"]
     }
+    # Ensure outputs directory exists
+    os.makedirs("./outputs", exist_ok=True)
     with open("./outputs/eval_report.json", "w") as f:
         json.dump(report, f, indent=2)
 

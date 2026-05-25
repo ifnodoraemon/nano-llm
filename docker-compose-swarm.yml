@@ -1,0 +1,85 @@
+version: "3.8"
+
+services:
+  # ==============================================================================
+  # Node 0 (Master Node): Coordinates the distributed training cluster
+  # ==============================================================================
+  master:
+    image: ifnodoraemon/nano-llm:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # CRITICAL: Use Host Network Mode to allow NCCL to bypass container overlay virtualization
+    # and directly access host InfiniBand (ib0) or RoCEv2 high-speed NICs!
+    network_mode: host
+    ipc: host # Prevents shared memory NCCL bus errors
+    volumes:
+      - .:/app
+      - /dev/shm:/dev/shm
+    environment:
+      - WORLD_SIZE=16 # 2 nodes * 8 GPUs = 16 global ranks
+      - MASTER_ADDR=192.168.1.100 # Direct private IP of Master Node 0
+      - MASTER_PORT=29500
+      - NNODES=2
+      - NODE_RANK=0
+      - NCCL_DEBUG=INFO
+      - NCCL_IB_DISABLE=0 # Enable InfiniBand natively
+      - NCCL_SOCKET_IFNAME=eth0,ib0 # Prioritize high-speed network interfaces
+    entrypoint: >
+      torchrun 
+      --nproc_per_node=8 
+      --nnodes=2 
+      --node_rank=0 
+      --master_addr=192.168.1.100 
+      --master_port=29500 
+      pretrain.py --use_fp8 True
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager # Anchor master to the Swarm Manager node
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all # Pass through all 8 local H800 GPUs on Node 0
+              capabilities: [gpu]
+
+  # ==============================================================================
+  # Node 1 (Worker Node): Joins the training cluster
+  # ==============================================================================
+  worker-node1:
+    image: ifnodoraemon/nano-llm:latest
+    network_mode: host
+    ipc: host
+    volumes:
+      - .:/app
+      - /dev/shm:/dev/shm
+    environment:
+      - WORLD_SIZE=16
+      - MASTER_ADDR=192.168.1.100 # Point worker back to Master IP
+      - MASTER_PORT=29500
+      - NNODES=2
+      - NODE_RANK=1 # Worker node is Rank 1
+      - NCCL_DEBUG=INFO
+      - NCCL_IB_DISABLE=0
+      - NCCL_SOCKET_IFNAME=eth0,ib0
+    entrypoint: >
+      torchrun 
+      --nproc_per_node=8 
+      --nnodes=2 
+      --node_rank=1 
+      --master_addr=192.168.1.100 
+      --master_port=29500 
+      pretrain.py --use_fp8 True
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.type == worker1 # Anchor worker to Node 1 via node labels
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all # Pass through all 8 local H800 GPUs on Node 1
+              capabilities: [gpu]
