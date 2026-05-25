@@ -63,6 +63,7 @@ We have organized all documentation into **100% Visual blueprints**, replacing l
 | 📈 **[1M Long-Context Blueprint](file:///home/ifnodoraemon/myagent/nano-llm/docs/context_engineering.md)** | • Dynamic NTK phase precompute sequence<br>• KV-Cache memory footprint metrics (GQA vs. MLA)<br>• Ring-Attention Context Parallel circular network<br>• Ring Attention computational loop states |
 | 🏎️ **[Performance & Self-Iteration Blueprint](file:///home/ifnodoraemon/myagent/nano-llm/docs/performance_benchmarks.md)** | • Activation Checkpointing forward/backward VRAM graph<br>• FSDP Parameter/Optimizer sharding comparison<br>• Fused AdamW hardware CUDA kernel sweeps<br>• Autonomous Model Self-Play DPO iteration loop<br>• Evaluation Benchmark logics (MMLU, GSM8K, ARC, etc.) |
 | 🛡️ **[LLM Risk Mitigation Blueprint](file:///home/ifnodoraemon/myagent/nano-llm/docs/risk_mitigation.md)** | • Loss Spikes & Training Collapse triggers & safeguards<br>• MoE Routing Collapse & Shared Expert Gated router balance<br>• DPO Reward Hacking & KL-regularization sequence loops<br>• FP8 dynamic range mapping underflow/overflow mitigations |
+| 🐳 **[Docker Swarm Multi-Node Deployment Blueprint](file:///home/ifnodoraemon/myagent/nano-llm/docs/swarm_multi_node_deployment.md)** | • Swarm Manager vs. Workers topology map<br>• Node labeling & overlay-bypassing host-network sharding<br>• PyTorch `torchrun` multi-node environment variables & launch scripts |
 
 ---
 
@@ -78,6 +79,7 @@ graph TD
     
     %% Config and environment
     Root --> DOCKER["Dockerfile / docker-compose.yml <br> (Multi-GPU CUDA host setup)"]:::file
+    Root --> SWARM["docker-compose-swarm.yml <br> (Docker Swarm Multi-Node)"]:::file
     
     %% Core Model
     Root --> MODEL["model.py <br> (MLA + MoE + FP8 + Checkpointing)"]:::file
@@ -114,6 +116,7 @@ graph TD
     DOCS --> DOC3["context_engineering.md"]:::file
     DOCS --> DOC4["performance_benchmarks.md"]:::file
     DOCS --> DOC5["risk_mitigation.md"]:::file
+    DOCS --> DOC6["swarm_multi_node_deployment.md"]:::file
 
     TESTS --> T1["test_model.py"]:::file
     TESTS --> T2["test_data.py"]:::file

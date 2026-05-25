@@ -63,6 +63,7 @@ graph TD
 | 📈 **[1M 超长上下文工程蓝图](docs/context_engineering.md)** | • 动态 NTK 频率基底预计算流程时序<br>• 百万 Token 上下文下 GQA 与 MLA 显存开销对比<br>• 基于 Ring-Attention 的 8 卡 GPU 虚拟环通信拓扑<br>• 环形注意力异步计算与缓存传递状态机 |
 | 🏎️ **[性能指标与自我迭代蓝图](docs/performance_benchmarks.md)** | • 激活检查点（Activation Checkpointing）显存均摊流<br>• PyTorch FSDP 权重与优化器参数分布式切分状态<br>• Fused AdamW 硬件 CUDA 单扫（Single-Sweep）提速机制<br>• 自动化 Self-Play DPO 自我进化与对齐回路流程<br>• 多榜单评测（MMLU, GSM8K, ARC 等）提取与评分流程 |
 | 🛡️ **[LLM 训练风险与对齐规避蓝图](docs/risk_mitigation.md)** | • Loss 骤增与训练收敛崩盘的诱因与四重防御流图<br>• MoE 路由崩溃与专家闲置的动态门控均衡与共享专家保障<br>• DPO 偏好对齐奖励黑客与基于 Reference Anchor 的 KL 正则惩罚<br>• FP8 动态范围截断与溢出噪声的 Tensor-wise 动态比例映射 |
+| 🐳 **[Docker Swarm 多机部署与调度蓝图](docs/swarm_multi_node_deployment.md)** | • Swarm 管理节点与工作节点分布式拓扑图<br>• 节点标签设置与绕过容器虚拟化的 Host 网络映射<br>• PyTorch `torchrun` 跨多机环境变量配置与容器启动时序 |
 
 ---
 
@@ -78,6 +79,7 @@ graph TD
     
     %% 环境与配置
     Root --> DOCKER["Dockerfile / docker-compose.yml <br> (多卡 NVIDIA 容器直通环境)"]:::file
+    Root --> SWARM["docker-compose-swarm.yml <br> (Docker Swarm 跨多机部署)"]:::file
     
     %% 模型内核
     Root --> MODEL["model.py <br> (MLA + MoE + FP8 + Checkpointing)"]:::file
@@ -114,6 +116,7 @@ graph TD
     DOCS --> DOC3["context_engineering.md"]:::file
     DOCS --> DOC4["performance_benchmarks.md"]:::file
     DOCS --> DOC5["risk_mitigation.md"]:::file
+    DOCS --> DOC6["swarm_multi_node_deployment.md"]:::file
 
     TESTS --> T1["test_model.py"]:::file
     TESTS --> T2["test_data.py"]:::file
