@@ -1,6 +1,12 @@
+<p align="center">
+  <img src="assets/logo.png" width="350" alt="nano-llm logo"/>
+</p>
+
 # nano-llm: Clean, Minimalist PyTorch LLM Training & Alignment Node
 
 Welcome to **nano-llm** (now upgraded with **nano-deepseek** capabilities)! This repository is a clean, minimal, and highly educational PyTorch implementation for pre-training, Supervised Fine-Tuning (SFT), Preference Alignment (DPO), and long-context/FP8 optimizations of modern LLMs, designed for **8x80GB H800 GPU** clusters.
+
+Read this in other languages: [English](README.md) | [简体中文](README_ZH.md)
 
 ---
 
@@ -47,6 +53,7 @@ We have organized all documentation into **100% Visual blueprints**, replacing l
 | ⚡ **[Attention & Position Coordinates Blueprint](file:///home/ifnodoraemon/myagent/nano-llm/docs/attention_and_position.md)** | • Softmax Attention Sharpening peaks comparison<br>• NTK-Aware Positional Coordinate stretching<br>• High-Resolution Double-Grid Visual projector flow<br>• Hard Negative SFT Data generation sequence |
 | 📈 **[1M Long-Context Blueprint](file:///home/ifnodoraemon/myagent/nano-llm/docs/context_engineering.md)** | • Dynamic NTK phase precompute sequence<br>• KV-Cache memory footprint metrics (GQA vs. MLA)<br>• Ring-Attention Context Parallel circular network<br>• Ring Attention computational loop states |
 | 🏎️ **[Performance & Self-Iteration Blueprint](file:///home/ifnodoraemon/myagent/nano-llm/docs/performance_benchmarks.md)** | • Activation Checkpointing forward/backward VRAM graph<br>• FSDP Parameter/Optimizer sharding comparison<br>• Fused AdamW hardware CUDA kernel sweeps<br>• Autonomous Model Self-Play DPO iteration loop<br>• Evaluation Benchmark logics (MMLU, GSM8K, ARC, etc.) |
+| 🛡️ **[LLM Risk Mitigation Blueprint](file:///home/ifnodoraemon/myagent/nano-llm/docs/risk_mitigation.md)** | • Loss Spikes & Training Collapse triggers & safeguards<br>• MoE Routing Collapse & Shared Expert Gated router balance<br>• DPO Reward Hacking & KL-regularization sequence loops<br>• FP8 dynamic range mapping underflow/overflow mitigations |
 
 ---
 
@@ -87,6 +94,7 @@ graph TD
     DOCS --> DOC2["attention_and_position.md"]:::file
     DOCS --> DOC3["context_engineering.md"]:::file
     DOCS --> DOC4["performance_benchmarks.md"]:::file
+    DOCS --> DOC5["risk_mitigation.md"]:::file
 ```
 
 ---
