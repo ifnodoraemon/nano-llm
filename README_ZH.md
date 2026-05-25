@@ -66,6 +66,7 @@ graph TD
 | 🐳 **[Docker Swarm 多机部署与调度蓝图](docs/swarm_multi_node_deployment.md)** | • Swarm 管理节点与工作节点分布式拓扑图<br>• 节点标签设置与绕过容器虚拟化的 Host 网络映射<br>• PyTorch `torchrun` 跨多机环境变量配置与容器启动时序 |
 | 📡 **[阶段 3 集群遥测健康监控报告](file:///home/ifnodoraemon/.gemini/antigravity-cli/brain/b9731614-1ca7-4068-b098-e69f35aea81a/walkthrough_telemetry.md)** | • 零依赖 CPU/内存/网卡/NVIDIA GPU 指标读取<br>• 宿主机与容器内部完美一致的优雅降级与模拟 fallback<br>• Step logs 与 50 步 ASCII cockpit 仪表盘设计 |
 | 🚀 **[阶段 4 五大维度技术跃升报告](file:///home/ifnodoraemon/.gemini/antigravity-cli/brain/b9731614-1ca7-4068-b098-e69f35aea81a/walkthrough_stage4.md)** | • NCCL 拓扑多网卡自调优与 GPUDirect RDMA 参数配置<br>• 非阻塞异步 Checkpoint 守护线程写与弹性热重启恢复<br>• 工业级 MinHash-LSH 文档近似去重与高精 Heuristic 质量过滤<br>• PagedAttention & Continuous Batching 高并发并发 Serving 实现 |
+| 🌊 **[阶段 5 深水区技术跨越 2.0 报告](file:///home/ifnodoraemon/.gemini/antigravity-cli/brain/b9731614-1ca7-4068-b098-e69f35aea81a/walkthrough_stage5.md)** | • 混合专家路由容量上限（Expert Capacity）与低分 Token 自动丢弃机制<br>• Hopper H800 架构原生 Tensor-wide 激活结合 Channel-wise 权重混合精度 FP8 动态缩放矩阵乘<br>• 基于非阻塞异步 NCCL all-gather-into-tensor 极致遮蔽多网卡间通信与计算重叠延迟<br>• 自动化超长上下文（8K-1M Token）大海捞针（Needle-in-a-Haystack）评测矩阵系统<br>• 基于 GRPO 强化学习的过程监督奖励模型（PRM）子推理步骤计分与无限循环去重去噪机制 |
 
 ---
 
@@ -110,6 +111,7 @@ graph TD
     UTILS --> U9["triton_fa3.py"]:::file
     UTILS --> U10["kv_eviction.py"]:::file
     UTILS --> U11["search_tree.py"]:::file
+    UTILS --> U12["overlap_helper.py"]:::file
     
     WEB --> W1["高端拟物玻璃化控制台前端 (FastAPI HUD)"]:::file
     
@@ -125,6 +127,7 @@ graph TD
     TESTS --> T3["test_grpo.py"]:::file
     TESTS --> T4["test_upgrades.py"]:::file
     TESTS --> T5["test_search_eviction.py"]:::file
+    TESTS --> T6["test_stage5_upgrades.py"]:::file
 ```
 
 ---

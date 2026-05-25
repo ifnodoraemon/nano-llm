@@ -66,6 +66,7 @@ We have organized all documentation into **100% Visual blueprints**, replacing l
 | 🐳 **[Docker Swarm Multi-Node Deployment Blueprint](file:///home/ifnodoraemon/myagent/nano-llm/docs/swarm_multi_node_deployment.md)** | • Swarm Manager vs. Workers topology map<br>• Node labeling & overlay-bypassing host-network sharding<br>• PyTorch `torchrun` multi-node environment variables & launch scripts |
 | 📡 **[Stage 3 Telemetry Walkthrough Report](file:///home/ifnodoraemon/.gemini/antigravity-cli/brain/b9731614-1ca7-4068-b098-e69f35aea81a/walkthrough_telemetry.md)** | • Direct `/proc` telemetry reading & `nvidia-smi` CSV queries<br>• Zero-dependency CPU/RAM/Net/GPU monitor cockpit<br>• Dynamic fallbacks and simulator designs |
 | 🚀 **[Stage 4 Multi-Dimension Upgrades Walkthrough](file:///home/ifnodoraemon/.gemini/antigravity-cli/brain/b9731614-1ca7-4068-b098-e69f35aea81a/walkthrough_stage4.md)** | • NCCL autotuning & RoCE network parameters<br>• Asynchronous non-blocking checkpointing thread queues<br>• Elastic self-healing states & auto fault-tolerance<br>• High-throughput linear-time MinHash-LSH deduplication ($O(N)$)<br>• PagedAttention & Continuous Batching concurrent scheduling |
+| 🌊 **[Stage 5 Deep-Water Upgrades 2.0 Walkthrough](file:///home/ifnodoraemon/.gemini/antigravity-cli/brain/b9731614-1ca7-4068-b098-e69f35aea81a/walkthrough_stage5.md)** | • Expert Capacity routing & Token Dropping load balancing<br>• Hopper H800 channel-wise dynamic FP8 scaling & hardware matmuls<br>• Non-blocking async communication-computation card-to-card pre-fetching<br>• Automated super-long context Needle-in-a-Haystack synthetic evaluator<br>• GRPO Process-Supervised Reward Model step-scoring & loop-prevention |
 
 ---
 
@@ -110,6 +111,7 @@ graph TD
     UTILS --> U9["triton_fa3.py"]:::file
     UTILS --> U10["kv_eviction.py"]:::file
     UTILS --> U11["search_tree.py"]:::file
+    UTILS --> U12["overlap_helper.py"]:::file
     
     WEB --> W1["Premium glassmorphic web dashboard HUD"]:::file
     
@@ -125,6 +127,7 @@ graph TD
     TESTS --> T3["test_grpo.py"]:::file
     TESTS --> T4["test_upgrades.py"]:::file
     TESTS --> T5["test_search_eviction.py"]:::file
+    TESTS --> T6["test_stage5_upgrades.py"]:::file
 ```
 
 ---
