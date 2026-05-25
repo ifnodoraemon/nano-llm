@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nano-llm"
+version = "1.0.0"
+description = "Clean, minimalist, and visual-first PyTorch LLM training, alignment (DPO, GRPO), and long-context (1M) repository optimization suite."
+readme = "README.md"
+authors = [
+    { name = "nano-llm Authors" }
+]
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2.0",
+    "transformers>=4.38.0",
+    "numpy>=1.24.0",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.28.0",
+    "huggingface-hub>=0.21.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "black>=24.0.0",
+    "flake8>=7.0.0",
+    "unittest-xml-reporting>=3.2.0"
+]
+
+[tool.black]
+line-length = 120
+target-version = ['py310']
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+)/
+'''
