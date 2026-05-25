@@ -4,6 +4,14 @@
 
 # nano-llm: 极简 PyTorch 大语言模型预训练与对齐计算节点
 
+<p align="center">
+  <a href="https://pytorch.org"><img src="https://img.shields.io/badge/PyTorch-2.2+-ee4c2c?style=flat-square&logo=pytorch&logoColor=white" alt="PyTorch"/></a>
+  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python"/></a>
+  <a href="https://github.com/ifnodoraemon/nano-llm/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue?style=flat-square" alt="License"/></a>
+  <a href="https://nvidia.com"><img src="https://img.shields.io/badge/Hardware-NVIDIA%20H800%20%7C%20A100-76B900?style=flat-square&logo=nvidia&logoColor=white" alt="NVIDIA GPU"/></a>
+  <a href="https://github.com/psf/black"><img src="https://img.shields.io/badge/code%20style-black-000000.svg?style=flat-square" alt="Black"/></a>
+</p>
+
 欢迎来到 **nano-llm**（现已升级 **nano-deepseek** 架构支持）！本仓库是一个纯净、极简且高度模块化的 PyTorch 全流程实现，涵盖现代大语言模型的预训练（Pre-training）、监督微调（SFT）、偏好对齐（DPO）以及百万级长上下文与 FP8 混合精度优化。专为 **8x80GB H800 GPU** 高性能集群设计。
 
 阅读其他语言版本: [English](README.md) | [简体中文](README_ZH.md)
@@ -153,3 +161,35 @@ sequenceDiagram
     BE->>HW: 执行静态 KV-Cache 图像投影合并与 Prefill 首词计算
     HW-->>User: 通过 SSE 流式返回回复 Token (打印首词生成毫秒 TTFT)
 ```
+
+---
+
+## 🗺️ 项目技术路线图与重要里程碑 (Visual Roadmap)
+
+```mermaid
+graph TD
+    classDef comp fill:#42e695,stroke:#005c1e,stroke-width:2px,color:#000;
+    classDef active fill:#00f2fe,stroke:#005c66,stroke-width:2px,color:#000;
+    classDef planned fill:#e2e2e2,stroke:#555,stroke-width:1px,color:#777;
+
+    C1["1. 定制 BPE 与二进制数据打包<br>(data.py / deduplicate.py)"]:::comp
+    C2["2. DeepSeek MLA + DeepSeekMoE 架构<br>(model.py)"]:::comp
+    C3["3. 动态 NTK-RoPE 1M 上下文 & FP8 计算<br>(pretrain.py / serve.py)"]:::comp
+    C4["4. 拟物化反重力大模型控制台 HUD<br>(FastAPI 仪表盘)"]:::comp
+    
+    P1["5. DeepSeek-R1 风格的 RLHF 与 GRPO 强化学习对齐<br>(planned_grpo.py)"]:::active
+    P2["6. 3D 并行分布式切分训练 <br>(TP + PP + DP 混合并行)"]:::planned
+    P3["7. 高吞吐静态量化推理内核 <br>(TensorRT-LLM / vLLM hooks)"]:::planned
+    
+    C1 --> C2 --> C3 --> C4
+    C4 -->|当前研发重心| P1
+    P1 --> P2 --> P3
+```
+
+---
+
+## 💖 您的支持是我们开源的动力 (Show Your Support)
+
+我们致力于打造全世界最纯净、最高性能、最易于学术与工程理解的纯 PyTorch 大模型预训练与对齐实现。如果您觉得这个项目对您有帮助，**请为我们点亮一颗 Star！** 您的支持是鼓励我们不断迭代和开源更强大功能的最大动力。⭐
+
+[![Star History Chart](https://api.star-history.com/svg?repos=ifnodoraemon/nano-llm&type=Date)](https://github.com/ifnodoraemon/nano-llm)

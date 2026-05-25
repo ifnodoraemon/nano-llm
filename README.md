@@ -4,6 +4,14 @@
 
 # nano-llm: Clean, Minimalist PyTorch LLM Training & Alignment Node
 
+<p align="center">
+  <a href="https://pytorch.org"><img src="https://img.shields.io/badge/PyTorch-2.2+-ee4c2c?style=flat-square&logo=pytorch&logoColor=white" alt="PyTorch"/></a>
+  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python"/></a>
+  <a href="https://github.com/ifnodoraemon/nano-llm/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue?style=flat-square" alt="License"/></a>
+  <a href="https://nvidia.com"><img src="https://img.shields.io/badge/Hardware-NVIDIA%20H800%20%7C%20A100-76B900?style=flat-square&logo=nvidia&logoColor=white" alt="NVIDIA GPU"/></a>
+  <a href="https://github.com/psf/black"><img src="https://img.shields.io/badge/code%20style-black-000000.svg?style=flat-square" alt="Black"/></a>
+</p>
+
 Welcome to **nano-llm** (now upgraded with **nano-deepseek** capabilities)! This repository is a clean, minimal, and highly educational PyTorch implementation for pre-training, Supervised Fine-Tuning (SFT), Preference Alignment (DPO), and long-context/FP8 optimizations of modern LLMs, designed for **8x80GB H800 GPU** clusters.
 
 Read this in other languages: [English](README.md) | [简体中文](README_ZH.md)
@@ -153,3 +161,35 @@ sequenceDiagram
     BE->>HW: Prefill static KV-Cache with image patches + prompt tokens
     HW-->>User: SSE streamed autoregressive tokens (TTFT ms logs)
 ```
+
+---
+
+## 🗺️ Visual Project Roadmap & Milestones
+
+```mermaid
+graph TD
+    classDef comp fill:#42e695,stroke:#005c1e,stroke-width:2px,color:#000;
+    classDef active fill:#00f2fe,stroke:#005c66,stroke-width:2px,color:#000;
+    classDef planned fill:#e2e2e2,stroke:#555,stroke-width:1px,color:#777;
+
+    C1["1. Custom BPE & flat binary packers<br>(data.py / deduplicate.py)"]:::comp
+    C2["2. DeepSeek MLA + DeepSeekMoE architectures<br>(model.py)"]:::comp
+    C3["3. Dynamic NTK-RoPE 1M context & FP8 calculations<br>(pretrain.py / serve.py)"]:::comp
+    C4["4. Interactive glassmorphic autopilot HUD<br>(FastAPI Control Panel)"]:::comp
+    
+    P1["5. DeepSeek-R1 style RLHF & GRPO Alignment<br>(planned_grpo.py)"]:::active
+    P2["6. 3D Model Parallelism <br>(TP + PP + DP sharding setups)"]:::planned
+    P3["7. Quantized static serving kernels <br>(TensorRT-LLM / vLLM hooks)"]:::planned
+    
+    C1 --> C2 --> C3 --> C4
+    C4 -->|Current Focus| P1
+    P1 --> P2 --> P3
+```
+
+---
+
+## 💖 Show Your Support & Star History
+
+We are committed to building the cleanest, most performant education-first PyTorch LLM implementation in the world. If you find this project valuable, **please give it a star!** It helps other researchers discover this repository and fuels our open-source developments. ⭐
+
+[![Star History Chart](https://api.star-history.com/svg?repos=ifnodoraemon/nano-llm&type=Date)](https://github.com/ifnodoraemon/nano-llm)
