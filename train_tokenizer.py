@@ -19,16 +19,30 @@ def get_stats(ids: List[int]) -> Dict[Tuple[int, int], int]:
     return counts
 
 def merge(ids: List[int], pair: Tuple[int, int], idx: int) -> List[int]:
-    """Replaces all occurrences of `pair` in `ids` with the new integer `idx`."""
+    """Replaces all occurrences of `pair` in `ids` with the new integer `idx` using fast C-level index searching."""
+    p0, p1 = pair
     newids = []
     i = 0
-    while i < len(ids):
-        if i < len(ids) - 1 and ids[i] == pair[0] and ids[i+1] == pair[1]:
-            newids.append(idx)
-            i += 2
-        else:
-            newids.append(ids[i])
-            i += 1
+    n = len(ids)
+    
+    try:
+        while i < n:
+            # Fast C-level search for p0
+            next_p0 = ids.index(p0, i)
+            # Copy everything from current position i to next_p0
+            newids.extend(ids[i:next_p0])
+            
+            # Check if it forms the pair
+            if next_p0 < n - 1 and ids[next_p0 + 1] == p1:
+                newids.append(idx)
+                i = next_p0 + 2
+            else:
+                newids.append(p0)
+                i = next_p0 + 1
+    except ValueError:
+        # p0 is not found in the rest of the list
+        newids.extend(ids[i:])
+        
     return newids
 
 
@@ -91,21 +105,19 @@ class CustomBPETokenizer:
         text_bytes = text.encode("utf-8")
         ids = list(text_bytes)
         
-        # Iteratively apply BPE merges in the exact order they were learned during training
-        while len(ids) >= 2:
-            stats = get_stats(ids)
-            # Find the pair in the current sequence that has the lowest merge rank
-            # (i.e. was learned earliest in training)
-            pair_to_merge = min(
-                stats.keys(), 
-                key=lambda p: self.merges.get(p, float("inf"))
-            )
-            
-            if pair_to_merge not in self.merges:
-                break # No more merge rules apply
+        # Maintain a set of unique token IDs currently present in the sequence
+        ids_set = set(ids)
+        
+        # Apply merges in the exact order they were learned during BPE training
+        for pair, new_id in self.merges.items():
+            if pair[0] not in ids_set or pair[1] not in ids_set:
+                continue
                 
-            new_id = self.merges[pair_to_merge]
-            ids = merge(ids, pair_to_merge, new_id)
+            old_len = len(ids)
+            ids = merge(ids, pair, new_id)
+            if len(ids) < old_len:
+                # Merge succeeded, add the new token ID to our active set
+                ids_set.add(new_id)
             
         return ids
 

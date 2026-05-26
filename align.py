@@ -124,9 +124,19 @@ def train():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # 2. Tokenizer & Dataset Loader
-    from utils.hub_adapter import HubAdapter
-    hub = HubAdapter()
-    tokenizer = hub.load_tokenizer_or_model("Qwen/Qwen2.5-7B" if hub.provider == "hf" else "qwen/Qwen2.5-7B", load_type="tokenizer", use_fast=True)
+    logger.info("Initializing tokenizer...")
+    from serve import CustomTokenizerAdapter
+    if os.path.exists("./data/custom_tokenizer.json"):
+        logger.info("Found custom trained BPE tokenizer. Loading from ./data/custom_tokenizer.json...")
+        from train_tokenizer import CustomBPETokenizer
+        raw_tok = CustomBPETokenizer()
+        raw_tok.load("./data/custom_tokenizer.json")
+        tokenizer = CustomTokenizerAdapter(raw_tok)
+    else:
+        logger.warning("Custom tokenizer not found. Falling back to AutoTokenizer...")
+        from utils.hub_adapter import HubAdapter
+        hub = HubAdapter()
+        tokenizer = hub.load_tokenizer_or_model("Qwen/Qwen2.5-7B" if hub.provider == "hf" else "qwen/Qwen2.5-7B", load_type="tokenizer", use_fast=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id or 0
 

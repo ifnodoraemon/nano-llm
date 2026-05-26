@@ -118,7 +118,17 @@ def train():
 
     # 2. Tokenizer & Dataset Loader
     logger.info("Initializing tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
+    from serve import CustomTokenizerAdapter
+    if os.path.exists("./data/custom_tokenizer.json"):
+        logger.info("Found custom trained BPE tokenizer. Loading from ./data/custom_tokenizer.json...")
+        from train_tokenizer import CustomBPETokenizer
+        raw_tok = CustomBPETokenizer()
+        raw_tok.load("./data/custom_tokenizer.json")
+        tokenizer = CustomTokenizerAdapter(raw_tok)
+    else:
+        logger.warning("Custom tokenizer not found. Falling back to AutoTokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
+    
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id or 0
 
@@ -137,17 +147,25 @@ def train():
 
     # 3. Load Modern LLaMA Model with custom LoRA configurations
     logger.info("Assembling custom LLaMA Transformer architecture...")
-    model_config = ModelConfig(
-        block_size=args.max_length,
-        vocab_size=len(tokenizer),
-        n_layer=28,   
-        n_head=16,
-        n_embd=2048,
-        lora_r=args.lora_r if args.use_lora else 0,
-        lora_alpha=args.lora_alpha
-    )
-    
-    model = Transformer(model_config).to(device)
+    base_checkpoint_path = "./outputs/checkpoint_pretrain.pt"
+    if os.path.exists(base_checkpoint_path):
+        logger.info(f"Found base pre-trained checkpoint at {base_checkpoint_path}. Loading configuration and weights...")
+        checkpoint = torch.load(base_checkpoint_path, map_location=device, weights_only=False)
+        model_config = checkpoint["config"]
+        model = Transformer(model_config).to(device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+    else:
+        logger.warning("Base pre-trained checkpoint not found. Instantiating model from scratch...")
+        model_config = ModelConfig(
+            block_size=args.max_length,
+            vocab_size=len(tokenizer),
+            n_layer=28,   
+            n_head=16,
+            n_embd=2048,
+            lora_r=args.lora_r if args.use_lora else 0,
+            lora_alpha=args.lora_alpha
+        )
+        model = Transformer(model_config).to(device)
     
     # If use_lora is active, freeze base layer parameters before creating optimizer
     if args.use_lora:

@@ -95,7 +95,7 @@ class GRPODataset(Dataset):
             "ground_truth": ground_truth
         }
 
-def grpo_collate_fn(batch):
+def grpo_collate_fn(batch, pad_token_id=0):
     """
     Collate function to pad variable-length prompt token sequences and stack vision patches.
     """
@@ -107,11 +107,11 @@ def grpo_collate_fn(batch):
     padded_prompt_ids = nn.utils.rnn.pad_sequence(
         prompt_ids_list,
         batch_first=True,
-        padding_value=0  # Assumes 0 is pad_token_id
+        padding_value=pad_token_id
     )
     
     # Attention mask
-    attention_masks = (padded_prompt_ids != 0).long()
+    attention_masks = (padded_prompt_ids != pad_token_id).long()
     
     # Batch pixel values
     pixel_values_list = []
@@ -490,10 +490,20 @@ def train():
         monitor = None
 
     # Load Tokenizer
-    from utils.hub_adapter import HubAdapter
-    hub = HubAdapter()
-    tokenizer = hub.load_tokenizer_or_model("gpt2" if hub.provider == "hf" else "AI-ModelScope/gpt2", load_type="tokenizer")
-    tokenizer.pad_token = tokenizer.eos_token
+    logger.info("Initializing tokenizer...")
+    from serve import CustomTokenizerAdapter
+    if os.path.exists("./data/custom_tokenizer.json"):
+        logger.info("Found custom trained BPE tokenizer. Loading from ./data/custom_tokenizer.json...")
+        from train_tokenizer import CustomBPETokenizer
+        raw_tok = CustomBPETokenizer()
+        raw_tok.load("./data/custom_tokenizer.json")
+        tokenizer = CustomTokenizerAdapter(raw_tok)
+    else:
+        logger.warning("Custom tokenizer not found. Falling back to AutoTokenizer...")
+        from utils.hub_adapter import HubAdapter
+        hub = HubAdapter()
+        tokenizer = hub.load_tokenizer_or_model("gpt2" if hub.provider == "hf" else "AI-ModelScope/gpt2", load_type="tokenizer")
+        tokenizer.pad_token = tokenizer.eos_token
     
     # Load base model checkpoint
     if is_master:
@@ -535,7 +545,7 @@ def train():
         dataset, 
         batch_size=args.batch_size, 
         sampler=sampler, 
-        collate_fn=grpo_collate_fn, 
+        collate_fn=lambda b: grpo_collate_fn(b, pad_token_id=tokenizer.pad_token_id), 
         shuffle=(sampler is None)
     )
 

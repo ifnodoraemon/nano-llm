@@ -16,6 +16,22 @@ class CustomTokenizerAdapter:
         self.pad_token_id = tokenizer.special_tokens["<|pad|>"]
         self.eos_token_id = tokenizer.special_tokens["<|im_end|>"]
         
+    def __len__(self) -> int:
+        return len(self.tokenizer.vocab) + len(self.tokenizer.special_tokens)
+
+    def __call__(self, text: str, **kwargs) -> dict:
+        input_ids = self.encode(text, **kwargs)
+        if kwargs.get("return_tensors") == "pt":
+            if not isinstance(input_ids, torch.Tensor):
+                input_ids = torch.tensor([input_ids])
+            attention_mask = torch.ones_like(input_ids)
+        else:
+            attention_mask = [1] * len(input_ids)
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask
+        }
+
     def encode(self, text: str, add_special_tokens: bool = False, **kwargs) -> list[int]:
         import re
         pattern = re.compile("(" + "|".join(map(re.escape, self.tokenizer.special_tokens.keys())) + ")")
