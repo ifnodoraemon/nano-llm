@@ -556,7 +556,8 @@ def main():
     # Instantiate Model architecture
     model = Transformer(model_config).to(device)
     # Load parameters
-    model.load_state_dict(checkpoint["model_state_dict"])
+    state_dict = checkpoint.get("model_state_dict", checkpoint.get("model"))
+    model.load_state_dict(state_dict)
     model.eval()
     
     # Load tokenizer

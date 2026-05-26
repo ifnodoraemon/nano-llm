@@ -413,8 +413,9 @@ def main():
     model_config = checkpoint["config"]
     
     # Instantiate Model
+    state_dict = checkpoint.get("model_state_dict", checkpoint.get("model"))
     model = Transformer(model_config).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model.load_state_dict(state_dict)
     model.eval()
     
     # Load tokenizer
@@ -445,8 +446,9 @@ def main():
     if args.baseline_checkpoint_path and os.path.exists(args.baseline_checkpoint_path):
         logger.info(f"Loading baseline checkpoint state from: {args.baseline_checkpoint_path}")
         base_checkpoint = torch.load(args.baseline_checkpoint_path, map_location=device, weights_only=False)
+        base_state = base_checkpoint.get("model_state_dict", base_checkpoint.get("model"))
         baseline_model = Transformer(base_checkpoint["config"]).to(device)
-        baseline_model.load_state_dict(base_checkpoint["model_state_dict"])
+        baseline_model.load_state_dict(base_state)
         baseline_model.eval()
     else:
         logger.info("No baseline checkpoint path provided. Running Self-Play Elo Arena comparing Model A against base initialization.")

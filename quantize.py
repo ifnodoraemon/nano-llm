@@ -78,7 +78,7 @@ def quantize_model_checkpoint(
     """
     logger.info(f"Loading checkpoint state from: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    state_dict = checkpoint["model_state_dict"]
+    state_dict = checkpoint.get("model_state_dict", checkpoint.get("model"))
     config = checkpoint["config"]
     
     # Linear layer weight keys that represent projections (wq, wk, wv, wo, w1, w2, w3, output)
@@ -147,8 +147,9 @@ def quantize_model_checkpoint(
     logger.info(f"🏎️  Compression Ratio: {compression_ratio:.2f}x")
     logger.info("=======================================================================")
     
-    # Save checkpoint
+    # Save checkpoint (normalize key to model_state_dict)
     checkpoint["model_state_dict"] = quantized_state_dict
+    checkpoint.pop("model", None)  # Remove 'model' key if exists (GRPO compat)
     checkpoint["quantized_bits"] = bits
     
     logger.info(f"Writing quantized model checkpoint to: {output_path}...")
