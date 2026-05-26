@@ -1,0 +1,69 @@
+2026-05-26 08:37:30,789 - INFO - Loading custom checkpoint state from: ./outputs
+/checkpoint_pretrain.pt
+2026-05-26 08:37:31,424 - INFO - Initializing tokenizer...
+2026-05-26 08:37:31,424 - INFO - Found custom trained BPE tokenizer. Loading fro
+m ./data/custom_tokenizer.json...
+2026-05-26 08:37:31,428 - INFO - Custom BPE Tokenizer loaded successfully from .
+/data/custom_tokenizer.json
+2026-05-26 08:37:31,440 - INFO - Loaded 6 chunks into RAG retriever.
+2026-05-26 08:37:31,441 - INFO - RAG Context injected successfully. Prompt expan
+ded.
+2026-05-26 08:37:31,441 - INFO - 🚀 Running high-performance static KV-cached aut
+oregressive serving on cuda...
+2026-05-26 08:37:31,560 - INFO - Pre-allocated static KV-Cache buffers for 4 lay
+ers. Memory allocated successfully.
+2026-05-26 08:37:31,560 - INFO - --- Stage 1: Prefill (ingesting 1937 prompt tok
+ens) ---
+2026-05-26 08:37:31,789 - INFO - ⏱️ Time to First Token (TTFT): 228.25 ms
+🤖 Assistant: dayd
+🤖 Assistant: daydlen
+🤖 Assistant: daydlenta, s
+🤖 Assistant: daydlenta, sum ed aloed
+🤖 Assistant: daydlenta, sum ed aloed s
+🤖 Assistant: daydlenta, sum ed aloed s s,
+🤖 Assistant: daydlenta, sum ed aloed s s, s
+🤖 Assistant: daydlenta, sum ed aloed s s, se
+🤖 Assistant: daydlenta, sum ed aloed s s, se, s, , ,
+🤖 Assistant: daydlenta, sum ed aloed s s, se, s, , , e, learn,
+🤖 Assistant: daydlenta, sum ed aloed s s, se, s, , , e, learn, the
+🤖 Assistant: daydlenta, sum ed aloed s s, se, s, , , e, learn, the ot
+🤖 Assistant: daydlenta, sum ed aloed s s, se, s, , , e, learn, the otabilit,
+🤖 Assistant: daydlenta, sum ed aloed s s, se, s, , , e, learn, the otabilit, Pyt
+hd
+be um , e
+be um , e  d, ,
+be um , e  d, , ,
+be um , e  d, , , , an
+be um , e  d, , , , an, , beud
+be um , e  d, , , , an, , beudc
+be um , e  d, , , , an, , beudc, sbes
+be um , e  d, , , , an, , beudc, sbesree, , ow
+be um , e  d, , , , an, , beudc, sbesree, , ow, dbee d
+be um , e  d, , , , an, , beudc, sbesree, , ow, dbee dee
+be um , e  d, , , , an, , beudc, sbesree, , ow, dbee deeit, ,
+ees d
+ees dum de , s
+ees dum de , sum , s cs
+ees dum de , sum , s cse ds , d
+ees dum de , sum , s cse ds , ddoum doe
+ees dum de , sum , s cse ds , ddoum doeum a f owN
+ees dum de , sum , s cse ds , ddoum doeum a f owNs, sse
+ees dum de , sum , s cse ds , ddoum doeum a f owNs, sse  u
+ees dum de , sum , s cse ds , ddoum doeum a f owNs, sse  us
+ees dum de , sum , s cse ds , ddoum doeum a f owNs, sse  us , be
+ees dum de , sum , s cse ds , ddoum doeum a f owNs, sse  us , betd, s
+ees dum de , sum , s cse ds , ddoum doeum a f owNs, sse  us , betd, sum
+ees dum de , sum , s cse ds , ddoum doeum a f owNs, sse  us , betd, sum , a f, l
+e,
+e, , rele, s
+e, , rele, s, owscle
+e, , rele, s, owsclethe ein, n
+e, , rele, s, owsclethe ein, n, ssc
+e, , rele, s, owsclethe ein, n, ssce
+e, , rele, s, owsclethe ein, n, sscesinton,
+e, , rele, s, owsclethe ein, n, sscesinton,  nde s
+e, , rele, s, owsclethe ein, n, sscesinton,  nde sd, insday
+e, , rele, s, owsclethe ein, n, sscesinton,  nde sd, insdaye the e dss
+e, , rele, s, owsclethe ein, n, sscesinton,  nde sd, insdaye the e dsssthe sled
+2026-05-26 08:37:32,704 - INFO -
+⚡ Generated 256 tokens in 1.14s | Decode speed: 350.27 tokens/second
