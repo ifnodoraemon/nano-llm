@@ -15,10 +15,10 @@ class TestGRPOMathAndFlow(unittest.TestCase):
     def setUp(self):
         # Set up a small mock model configuration
         self.config = ModelConfig(
-            dim=128,
+            n_embd=128,
             n_layer=2,
             n_head=4,
-            n_kv_heads=2,
+            n_kv_head=2,
             vocab_size=1000,
             block_size=128,
             use_mla=True,
@@ -82,7 +82,7 @@ class TestGRPOMathAndFlow(unittest.TestCase):
         self.assertTrue(torch.all(gen_mask[:, prompt_len:] == 1.0))
         
         # Compute forward pass for action log probabilities
-        logits = self.model(full_seqs)
+        logits, _ = self.model(full_seqs)
         logprobs = compute_action_logprobs(logits, full_seqs, gen_mask)
         
         # Logprob per prompt element

@@ -77,11 +77,12 @@ class BackgroundCheckpointSaver:
             "loss": loss
         }
         
+        import time
         manifest_data = {
             "latest_step": step,
             "latest_epoch": epoch,
             "latest_loss": loss,
-            "timestamp": float(torch.cuda.Event().record() if torch.cuda.is_available() else 0.0) # Dummy or system time
+            "timestamp": float(time.time())
         }
         
         os.makedirs(out_dir, exist_ok=True)
@@ -138,7 +139,7 @@ class ElasticRestoreManager:
         Returns (restored_step, restored_epoch, restored_loss).
         """
         logger.info(f"🔄 [Elastic Recovery] Attemping training state recovery from {self.filepath}...")
-        checkpoint = torch.load(self.filepath, map_location="cpu")
+        checkpoint = torch.load(self.filepath, map_location="cpu", weights_only=False)
         
         # Load weights
         raw_model = model.module if hasattr(model, "module") else model

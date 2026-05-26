@@ -109,7 +109,7 @@ class SearchTreeDecoder:
         
         curr_seq = seq.clone()
         for _ in range(chunk_len):
-            logits = self.model(curr_seq)
+            logits, _ = self.model(curr_seq)
             next_logits = logits[:, -1, :] / max(temp, 1e-5)
             probs = F.softmax(next_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)

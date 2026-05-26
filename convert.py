@@ -108,7 +108,7 @@ def convert_hf_to_nano(hf_model_path: str, output_pt_path: str):
 def convert_nano_to_hf(nano_pt_path: str, hf_config_ref_path: str, output_hf_dir: str):
     """Loads a nano-llm .pt file and exports a HuggingFace standard checkpoint directory."""
     logger.info(f"Loading nano-llm checkpoint from: {nano_pt_path}")
-    checkpoint = torch.load(nano_pt_path, map_location="cpu")
+    checkpoint = torch.load(nano_pt_path, map_location="cpu", weights_only=False)
     nano_state = checkpoint["model_state_dict"]
     nano_config = checkpoint["config"]
     

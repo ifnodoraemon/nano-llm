@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
+from typing import Any
 from transformers import AutoTokenizer
 
 from model import ModelConfig, Transformer
@@ -80,9 +81,10 @@ class GRPODataset(Dataset):
             return_tensors="pt"
         )
         
-        # Process image features if image exists (simulate or extract)
+        # Process image features if image exists (load actual image features)
         if image_path is not None:
-            pixel_values = torch.randn(self.num_patches, self.vision_dim)
+            from utils.vision_helper import extract_image_features
+            pixel_values = extract_image_features(image_path, self.vision_dim, self.num_patches)
         else:
             pixel_values = None
             
@@ -236,6 +238,13 @@ def evaluate_completion_rewards(
                     if consecutive_dups >= 2:
                         reward -= 1.0  # Penalize duplicate line cycles
                         
+            # F. Visual Multimodal Reasoning Reward
+            if any(w in prompt.lower() for w in ["image", "chart", "graph", "screenshot", "picture", "figure", "look"]):
+                visual_keywords = ["image", "pixels", "coordinate", "plot", "axis", "color", "shape", "visual", "figure", "box", "center", "left", "right", "top", "bottom", "label"]
+                hits = sum(1 for w in visual_keywords if w in completion.lower())
+                if hits >= 2:
+                    reward += 0.5  # Reward visual descriptor utilization
+                        
         rewards.append(reward)
         
     rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
@@ -311,12 +320,42 @@ def generate_completions(
     pixel_values: torch.Tensor = None,
     max_gen_len: int = 256,
     temperature: float = 0.8,
-    top_p: float = 0.9
+    top_p: float = 0.9,
+    use_mcts: bool = False,
+    tokenizer: Any = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Generates tokens autoregressively from prompts and returns the full 
     token sequences (prompt + generation) alongside generation masks.
+    Supports Monte Carlo Tree Search (MCTS) path search.
     """
+    if use_mcts and tokenizer is not None:
+        from utils.mcts_engine import MCTSEngine
+        engine = MCTSEngine(model, tokenizer, num_simulations=8)
+        
+        batch_size, prompt_len = prompt_ids.shape
+        device = prompt_ids.device
+        
+        full_seqs = torch.zeros(batch_size, prompt_len + max_gen_len, dtype=torch.long, device=device)
+        full_seqs[:, :prompt_len] = prompt_ids
+        gen_mask = torch.zeros_like(full_seqs, dtype=torch.float32)
+        gen_mask[:, prompt_len:] = 1.0
+        
+        for b in range(batch_size):
+            p_text = tokenizer.decode(prompt_ids[b].tolist(), skip_special_tokens=True)
+            search_res = engine.search(p_text)
+            
+            res_text = search_res[len(p_text):] if search_res.startswith(p_text) else search_res
+            gen_ids = tokenizer.encode(res_text, return_tensors="pt").to(device)[0]
+            
+            if len(gen_ids) > max_gen_len:
+                gen_ids = gen_ids[:max_gen_len]
+            
+            full_seqs[b, prompt_len : prompt_len + len(gen_ids)] = gen_ids
+            gen_mask[b, prompt_len + len(gen_ids):] = 0.0
+            
+        return full_seqs, gen_mask
+
     model.eval()
     batch_size, prompt_len = prompt_ids.shape
     device = prompt_ids.device
@@ -333,7 +372,7 @@ def generate_completions(
     for i in range(max_gen_len):
         curr_pos = prompt_len + i
         # Slice active window
-        logits = model(full_seqs[:, :curr_pos], pixel_values=pixel_values)
+        logits, _ = model(full_seqs[:, :curr_pos], pixel_values=pixel_values)
         # Next-token logits
         next_logits = logits[:, -1, :]
         
@@ -414,6 +453,7 @@ def train():
     parser.add_argument("--clip_eps", type=float, default=0.2, help="PPO clip range parameter")
     parser.add_argument("--max_lr", type=float, default=1e-6, help="Max learning rate")
     parser.add_argument("--output_dir", type=str, default="./outputs_grpo", help="Model saving directory")
+    parser.add_argument("--use_mcts", type=str, default="False", help="Enable Monte Carlo Tree Search rollouts in GRPO")
     args = parser.parse_args()
 
     # DDP Distributed environment
@@ -450,13 +490,15 @@ def train():
         monitor = None
 
     # Load Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")  # Fallback BPE tokenizer
+    from utils.hub_adapter import HubAdapter
+    hub = HubAdapter()
+    tokenizer = hub.load_tokenizer_or_model("gpt2" if hub.provider == "hf" else "AI-ModelScope/gpt2", load_type="tokenizer")
     tokenizer.pad_token = tokenizer.eos_token
     
     # Load base model checkpoint
     if is_master:
         logger.info(f"Loading base SFT model from checkpoint: {args.sft_checkpoint_path}")
-    checkpoint = torch.load(args.sft_checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(args.sft_checkpoint_path, map_location="cpu", weights_only=False)
     config = checkpoint["config"]
     
     # Instantiate models
@@ -561,7 +603,9 @@ def train():
                     pixel_values=p_val,
                     max_gen_len=args.max_gen_len,
                     temperature=0.8,
-                    top_p=0.9
+                    top_p=0.9,
+                    use_mcts=args.use_mcts.lower() == "true",
+                    tokenizer=tokenizer
                 )
                 
                 # Decode completions to text for reward evaluations
@@ -588,11 +632,11 @@ def train():
                 # 4. Compute Log Probabilities under Old/Reference Model & Current Policy Model
                 # In GRPO, we sample using policy_model and compute active forward logits
                 policy_model.train()
-                policy_logits = policy_model(full_seqs, pixel_values=p_val)
+                policy_logits, _ = policy_model(full_seqs, pixel_values=p_val)
                 policy_logprobs = compute_action_logprobs(policy_logits, full_seqs, gen_mask)
                 
                 with torch.no_grad():
-                    ref_logits = ref_model(full_seqs, pixel_values=p_val)
+                    ref_logits, _ = ref_model(full_seqs, pixel_values=p_val)
                     ref_logprobs = compute_action_logprobs(ref_logits, full_seqs, gen_mask)
                     
                 # In first micro-step, old_policy logprobs are equivalent to policy logprobs (surrogate starts at 1.0)

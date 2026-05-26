@@ -1,5 +1,6 @@
 import unittest
 import torch
+import torch.nn as nn
 import math
 from model import ModelConfig, RMSNorm, precompute_freqs_cis, apply_rotary_emb, Transformer, LoRALinear
 
@@ -163,8 +164,8 @@ class TestTransformerModules(unittest.TestCase):
         # 1. Forward pass without targets (inference)
         logits, loss = model(tokens, pixel_values=pixel_values)
         self.assertIsNone(loss)
-        # Should return logits of the final sequence step
-        self.assertEqual(logits.shape, (1, 1, 1000))
+        # Should return logits of the full sequence
+        self.assertEqual(logits.shape, (1, 9, 1000))
         
         # 2. Forward pass with targets (training)
         logits_train, loss_train = model(tokens, pixel_values=pixel_values, targets=targets)
@@ -185,7 +186,7 @@ class TestTransformerModules(unittest.TestCase):
         x = torch.randn(4, 16)
         out = fp8_layer(x)
         self.assertEqual(out.shape, (4, 8))
-        self.assertEqual(fp8_layer.x_scale.item(), 1.0) # CPU fallback remains 1.0
+        self.assertGreater(fp8_layer.x_scale.item(), 0.0) # Scale buffer should be computed and positive
 
     def test_convert_to_fp8_recursive(self):
         """
@@ -228,7 +229,7 @@ class TestTransformerModules(unittest.TestCase):
         
         # Input shape: (batch=2, seq_len=8, n_embd=64)
         x = torch.randn(2, 8, 64)
-        freqs_cis = precompute_freqs_cis(dim=32, end=16) # head_dim = 64 // 2 = 32
+        freqs_cis = precompute_freqs_cis(dim=32, end=16)[:8] # head_dim = 64 // 2 = 32
         
         # Forward pass
         out = mla_layer(x, freqs_cis=freqs_cis)

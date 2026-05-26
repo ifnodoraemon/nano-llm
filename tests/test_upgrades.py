@@ -30,7 +30,7 @@ class TestAllFutureUpgrades(unittest.TestCase):
         self.assertEqual(output_col.shape, (batch_size, seq_len, out_features // 2))
         
         # Test RowParallelLinear (sharding across rows)
-        row_layer = RowParallelLinear(in_features // 2, out_features, world_size=2, rank=0).to(self.device)
+        row_layer = RowParallelLinear(out_features, out_features, world_size=2, rank=0).to(self.device)
         output_row = row_layer(output_col)
         self.assertEqual(output_row.shape, (batch_size, seq_len, out_features))
 
@@ -53,8 +53,8 @@ class TestAllFutureUpgrades(unittest.TestCase):
         
         # 2. Write simulated token keys/values to logical slots
         for i in range(seq_len):
-            k = torch.randn(num_heads, head_dim, device=self.device)
-            v = torch.randn(num_heads, head_dim, device=self.device)
+            k = torch.randn(num_heads, head_dim, device=self.device, dtype=torch.float16)
+            v = torch.randn(num_heads, head_dim, device=self.device, dtype=torch.float16)
             manager.write_to_cache(seq_id, logical_pos=i, k_token=k, v_token=v)
             
         # Verify block free slots decreased
@@ -63,7 +63,7 @@ class TestAllFutureUpgrades(unittest.TestCase):
         
         # 3. Compute attention over paged slots
         kernel = PagedAttentionKernel(head_dim)
-        q = torch.randn(1, num_heads, head_dim, device=self.device)
+        q = torch.randn(1, num_heads, head_dim, device=self.device, dtype=torch.float16)
         output = kernel(q, seq_id, manager, seq_len)
         
         self.assertEqual(output.shape, (1, num_heads, head_dim))

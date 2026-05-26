@@ -113,7 +113,7 @@ class TrainingTelemetry:
         if os.path.exists(checkpoint_path):
             try:
                 logger.info(f"Attempting weight rollback to last stable checkpoint: '{checkpoint_path}'...")
-                checkpoint = torch.load(checkpoint_path, map_location="cpu")
+                checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
                 
                 # Extract state dict
                 if "model_state_dict" in checkpoint:

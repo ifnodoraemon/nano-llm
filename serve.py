@@ -10,6 +10,41 @@ from model import Transformer
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+class CustomTokenizerAdapter:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.pad_token_id = tokenizer.special_tokens["<|pad|>"]
+        self.eos_token_id = tokenizer.special_tokens["<|im_end|>"]
+        
+    def encode(self, text: str, add_special_tokens: bool = False, **kwargs) -> list[int]:
+        import re
+        pattern = re.compile("(" + "|".join(map(re.escape, self.tokenizer.special_tokens.keys())) + ")")
+        parts = pattern.split(text)
+        tokens = []
+        for part in parts:
+            if part in self.tokenizer.special_tokens:
+                tokens.append(self.tokenizer.special_tokens[part])
+            elif part:
+                tokens.extend(self.tokenizer.encode(part))
+        if kwargs.get("return_tensors") == "pt":
+            return torch.tensor([tokens])
+        return tokens
+        
+    def decode(self, ids, skip_special_tokens: bool = False, **kwargs) -> str:
+        if hasattr(ids, "tolist"):
+            ids = ids.tolist()
+        if isinstance(ids, list) and len(ids) > 0 and isinstance(ids[0], list):
+            ids = ids[0]
+        ids = [int(i) for i in ids]
+        if skip_special_tokens:
+            special_vals = set(self.tokenizer.special_tokens.values())
+            ids = [i for i in ids if i not in special_vals]
+        valid_ids = []
+        for idx in ids:
+            if idx in self.tokenizer.vocab or idx in self.tokenizer.special_tokens.values():
+                valid_ids.append(idx)
+        return self.tokenizer.decode(valid_ids)
+
 # ==============================================================================
 # High-Performance Autoregressive Generation with Static KV-Cache
 # ==============================================================================
@@ -39,16 +74,18 @@ def generate_with_static_cache(
     prompt_len = len(prompt_ids)
     
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+    model.to(dtype=dtype)
     
     # --- Pre-allocate contiguous static KV cache buffers ---
     n_kv_heads = model.config.n_kv_head if model.config.n_kv_head is not None else model.config.n_head
     head_dim = model.config.n_embd // model.config.n_head
     
+    max_block_size = max(model.config.block_size, prompt_len + max_new_tokens + 32)
     kv_caches = []
     for _ in range(model.config.n_layer):
         # Shape: (batch_size=1, max_block_size, n_kv_heads, head_dim)
-        k_cache = torch.zeros(1, model.config.block_size, n_kv_heads, head_dim, device=device, dtype=dtype)
-        v_cache = torch.zeros(1, model.config.block_size, n_kv_heads, head_dim, device=device, dtype=dtype)
+        k_cache = torch.zeros(1, max_block_size, n_kv_heads, head_dim, device=device, dtype=dtype)
+        v_cache = torch.zeros(1, max_block_size, n_kv_heads, head_dim, device=device, dtype=dtype)
         kv_caches.append((k_cache, v_cache))
         
     logger.info(f"Pre-allocated static KV-Cache buffers for {model.config.n_layer} layers. Memory allocated successfully.")
@@ -105,7 +142,7 @@ def generate_with_static_cache(
     decode_start_time = time.time();
     
     for _ in range(max_new_tokens - 1):
-        if curr_pos >= model.config.block_size - 1:
+        if curr_pos >= max_block_size - 1:
             logger.warning("Context block limit reached. Terminating generation.")
             break
             
@@ -113,9 +150,9 @@ def generate_with_static_cache(
         if curr_pos >= evictor.max_cache_size - 1:
             for k_cache, v_cache in kv_caches:
                 k_cache[:, evictor.num_sinks : evictor.max_cache_size - 1, :, :] = \
-                    k_cache[:, curr_pos - evictor.recent_window + 1 : curr_pos, :, :]
+                    k_cache[:, curr_pos - evictor.recent_window + 1 : curr_pos, :, :].clone()
                 v_cache[:, evictor.num_sinks : evictor.max_cache_size - 1, :, :] = \
-                    v_cache[:, curr_pos - evictor.recent_window + 1 : curr_pos, :, :]
+                    v_cache[:, curr_pos - evictor.recent_window + 1 : curr_pos, :, :].clone()
             curr_pos = evictor.max_cache_size - 1
             
         # Feed ONLY the single new token!
@@ -199,22 +236,25 @@ def generate_with_speculative_decoding(
     prompt_len = len(prompt_ids)
     
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+    model.to(dtype=dtype)
+    draft_model.to(dtype=dtype)
     
     # --- Pre-allocate contiguous static KV cache buffers for BOTH target and draft models ---
     n_kv_heads = model.config.n_kv_head if model.config.n_kv_head is not None else model.config.n_head
     head_dim = model.config.n_embd // model.config.n_head
     
+    max_block_size = max(model.config.block_size, prompt_len + max_new_tokens + 32)
     target_caches = []
     draft_caches = []
     
     for _ in range(model.config.n_layer):
-        k_cache = torch.zeros(1, model.config.block_size, n_kv_heads, head_dim, device=device, dtype=dtype)
-        v_cache = torch.zeros(1, model.config.block_size, n_kv_heads, head_dim, device=device, dtype=dtype)
+        k_cache = torch.zeros(1, max_block_size, n_kv_heads, head_dim, device=device, dtype=dtype)
+        v_cache = torch.zeros(1, max_block_size, n_kv_heads, head_dim, device=device, dtype=dtype)
         target_caches.append((k_cache, v_cache))
         
     for _ in range(draft_config.n_layer):
-        k_cache = torch.zeros(1, model.config.block_size, n_kv_heads, head_dim, device=device, dtype=dtype)
-        v_cache = torch.zeros(1, model.config.block_size, n_kv_heads, head_dim, device=device, dtype=dtype)
+        k_cache = torch.zeros(1, max_block_size, n_kv_heads, head_dim, device=device, dtype=dtype)
+        v_cache = torch.zeros(1, max_block_size, n_kv_heads, head_dim, device=device, dtype=dtype)
         draft_caches.append((k_cache, v_cache))
         
     logger.info("Pre-allocated static KV-Cache buffers for Speculative Decoding (Target & Draft).")
@@ -267,7 +307,7 @@ def generate_with_speculative_decoding(
     K = 4 # Speculative lookahead window size
     
     while tokens_generated < max_new_tokens:
-        if curr_pos + K >= model.config.block_size - 1:
+        if curr_pos + K >= max_block_size - 1:
             logger.warning("Context window bounds reached. Exiting decoding.")
             break
             
@@ -275,15 +315,15 @@ def generate_with_speculative_decoding(
         if curr_pos >= evictor.max_cache_size - 1:
             for k_cache, v_cache in target_caches:
                 k_cache[:, evictor.num_sinks : evictor.max_cache_size - 1, :, :] = \
-                    k_cache[:, curr_pos - evictor.recent_window + 1 : curr_pos, :, :]
+                    k_cache[:, curr_pos - evictor.recent_window + 1 : curr_pos, :, :].clone()
                 v_cache[:, evictor.num_sinks : evictor.max_cache_size - 1, :, :] = \
-                    v_cache[:, curr_pos - evictor.recent_window + 1 : curr_pos, :, :]
+                    v_cache[:, curr_pos - evictor.recent_window + 1 : curr_pos, :, :].clone()
             
             for k_cache, v_cache in draft_caches:
                 k_cache[:, evictor.num_sinks : evictor.max_cache_size - 1, :, :] = \
-                    k_cache[:, curr_pos - evictor.recent_window + 1 : curr_pos, :, :]
+                    k_cache[:, curr_pos - evictor.recent_window + 1 : curr_pos, :, :].clone()
                 v_cache[:, evictor.num_sinks : evictor.max_cache_size - 1, :, :] = \
-                    v_cache[:, curr_pos - evictor.recent_window + 1 : curr_pos, :, :]
+                    v_cache[:, curr_pos - evictor.recent_window + 1 : curr_pos, :, :].clone()
             curr_pos = evictor.max_cache_size - 1
             
         # 1. Draft model generates K tokens greedily (using its own KV-cache)
@@ -374,6 +414,9 @@ def generate_with_paged_attention_continuous_batching(
     2) Continuous Batching concurrent scheduling of multiple user prompts
     """
     logger.info(f"🚀 Initializing PagedAttention & Continuous Batching Concurrency Pipeline for {len(prompts)} requests...")
+    
+    dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+    model.to(dtype=dtype)
     
     from utils.paged_attention import PagedCacheManager, PagedAttentionKernel
     
@@ -484,12 +527,14 @@ def main():
     parser.add_argument("--image", type=str, default=None, help="Optional image path or URL for multimodal VLM serving")
     parser.add_argument("--speculative", type=bool, default=False, help="Enable Speculative Decoding acceleration with 2-layer draft model")
     parser.add_argument("--paged_continuous", type=bool, default=False, help="Enable PagedAttention & Continuous Batching concurrent serving")
+    parser.add_argument("--reasoning_effort", type=str, default="low", choices=["low", "medium", "high"], help="Reasoning effort level (MCTS search tree)")
+    parser.add_argument("--rag_sources", type=str, default=None, help="Comma-separated file paths for RAG knowledge base")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     logger.info(f"Loading custom checkpoint state from: {args.checkpoint_path}")
-    checkpoint = torch.load(args.checkpoint_path, map_location=device)
+    checkpoint = torch.load(args.checkpoint_path, map_location=device, weights_only=False)
     model_config = checkpoint["config"]
     
     # Instantiate Model architecture
@@ -500,9 +545,20 @@ def main():
     
     # Load tokenizer
     logger.info("Initializing tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B") 
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id or 0
+    import os
+    if os.path.exists("./data/custom_tokenizer.json"):
+        logger.info("Found custom trained BPE tokenizer. Loading from ./data/custom_tokenizer.json...")
+        from train_tokenizer import CustomBPETokenizer
+        raw_tok = CustomBPETokenizer()
+        raw_tok.load("./data/custom_tokenizer.json")
+        tokenizer = CustomTokenizerAdapter(raw_tok)
+    else:
+        logger.warning("Custom tokenizer not found. Falling back to ModelScope/HuggingFace...")
+        from utils.hub_adapter import HubAdapter
+        hub = HubAdapter()
+        tokenizer = hub.load_tokenizer_or_model("gpt2" if hub.provider == "hf" else "AI-ModelScope/gpt2", load_type="tokenizer")
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id or 0
         
     # Process image if provided
     if args.image is not None:
@@ -516,10 +572,47 @@ def main():
     else:
         pixel_values = None
         
-    if args.paged_continuous:
+    prompt = args.prompt
+    
+    # Process RAG if sources are specified
+    if args.rag_sources:
+        import os
+        from utils.rag_retriever import ChunkProcessor, HybridRetriever
+        processor = ChunkProcessor()
+        retriever = HybridRetriever()
+        
+        chunks = []
+        paths = [p.strip() for p in args.rag_sources.split(",")]
+        for p in paths:
+            if os.path.exists(p):
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        text = f.read()
+                        chunks.extend(processor.split_text(text))
+                except Exception as e:
+                    logger.error(f"Failed to read RAG source {p}: {e}")
+            else:
+                logger.warning(f"RAG source path {p} does not exist.")
+                
+        if chunks:
+            retriever.fit(chunks)
+            logger.info(f"Loaded {len(chunks)} chunks into RAG retriever.")
+            retrieved_chunks = retriever.retrieve(args.prompt, top_k=2)
+            if retrieved_chunks:
+                context = "\n---\n".join(retrieved_chunks)
+                prompt = f"Use the following reference documents to answer the question:\n{context}\n\nQuestion: {args.prompt}"
+                logger.info(f"RAG Context injected successfully. Prompt expanded.")
+        
+    if args.reasoning_effort == "high":
+        from utils.mcts_engine import MCTSEngine
+        engine = MCTSEngine(model, tokenizer, num_simulations=16)
+        logger.info(f"🚀 Running high-performance Monte Carlo Tree Search reasoning search...")
+        response = engine.search(prompt)
+        print(f"\n🤖 Assistant (MCTS Search Result): {response}")
+    elif args.paged_continuous:
         logger.info(f"🚀 Running PagedAttention & Continuous Batching concurrent serving on {device}...")
         test_prompts = [
-            args.prompt,
+            prompt,
             "Explain DeepSeek Multi-Head Latent Attention in 2 sentences.",
             "Write a simple Python function to calculate Fibonacci series."
         ]
@@ -536,7 +629,7 @@ def main():
         generate_with_speculative_decoding(
             model=model,
             tokenizer=tokenizer,
-            prompt=args.prompt,
+            prompt=prompt,
             pixel_values=pixel_values,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
@@ -548,7 +641,7 @@ def main():
         generate_with_static_cache(
             model=model,
             tokenizer=tokenizer,
-            prompt=args.prompt,
+            prompt=prompt,
             pixel_values=pixel_values,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,

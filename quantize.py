@@ -77,7 +77,7 @@ def quantize_model_checkpoint(
     applies RTN compression, and saves a simulated quantized checkpoint.
     """
     logger.info(f"Loading checkpoint state from: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state_dict = checkpoint["model_state_dict"]
     config = checkpoint["config"]
     

@@ -29,6 +29,11 @@ class ModelConfig:
     num_active_experts: int = 2 # Number of active routed experts per token
     rope_scaling: float = 1.0   # NTK-Aware RoPE scaling factor for 1M long-context extrapolation
     attn_scale_multiplier: float = 1.0 # Attention logits scaling multiplier to sharpen attention maps
+    tp_size: int = 1
+    pp_size: int = 1
+    ep_size: int = 1
+    use_triton_mla: bool = False
+    use_triton: bool = False
 
 
 
@@ -43,7 +48,10 @@ class RMSNorm(nn.Module):
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, use_triton: bool = False) -> torch.Tensor:
+        if use_triton:
+            from utils.triton_kernels import triton_rms_norm
+            return triton_rms_norm(x, self.weight, self.eps)
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
@@ -148,41 +156,64 @@ def apply_rotary_emb(
 class SwiGLU_MLP(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
+        self.config = config
         hidden_dim = int(2 * (config.n_embd * 4) / 3)
         if config.ffn_dim_multiplier is not None:
             hidden_dim = int(config.ffn_dim_multiplier * hidden_dim)
         hidden_dim = config.multiple_of * ((hidden_dim + config.multiple_of - 1) // config.multiple_of)
 
-        def get_linear(in_dim, out_dim):
+        from utils.tensor_parallel import ColumnParallelLinear, RowParallelLinear, get_tp_size
+        tp_active = get_tp_size() > 1
+
+        def get_linear(in_dim, out_dim, is_col=True):
+            if tp_active:
+                if is_col:
+                    return ColumnParallelLinear(in_dim, out_dim, bias=False)
+                else:
+                    return RowParallelLinear(in_dim, out_dim, bias=False)
             if config.lora_r > 0:
                 return LoRALinear(in_dim, out_dim, r=config.lora_r, lora_alpha=config.lora_alpha, lora_dropout=config.lora_dropout, bias=False)
             return nn.Linear(in_dim, out_dim, bias=False)
 
-        self.w1 = get_linear(config.n_embd, hidden_dim)
-        self.w3 = get_linear(config.n_embd, hidden_dim)
-        self.w2 = get_linear(hidden_dim, config.n_embd)
+        self.w1 = get_linear(config.n_embd, hidden_dim, is_col=True)
+        self.w3 = get_linear(config.n_embd, hidden_dim, is_col=True)
+        self.w2 = get_linear(hidden_dim, config.n_embd, is_col=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.config.use_triton:
+            from utils.triton_kernels import triton_swiglu
+            gate = self.w1(x)
+            up = self.w3(x)
+            return self.w2(triton_swiglu(gate, up))
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.n_heads = config.n_head
-        self.n_kv_heads = config.n_kv_head if config.n_kv_head is not None else config.n_head
+        self.config = config
+        from utils.tensor_parallel import ColumnParallelLinear, RowParallelLinear, get_tp_size
+        tp_size = get_tp_size()
+        
+        self.n_heads = config.n_head // tp_size
+        self.n_kv_heads = (config.n_kv_head if config.n_kv_head is not None else config.n_head) // tp_size
         self.head_dim = config.n_embd // config.n_head
         self.n_rep = self.n_heads // self.n_kv_heads
         
-        def get_linear(in_dim, out_dim):
+        def get_linear(in_dim, out_dim, is_col=True):
+            if tp_size > 1:
+                if is_col:
+                    return ColumnParallelLinear(in_dim, out_dim, bias=False)
+                else:
+                    return RowParallelLinear(in_dim, out_dim, bias=False)
             if config.lora_r > 0:
                 return LoRALinear(in_dim, out_dim, r=config.lora_r, lora_alpha=config.lora_alpha, lora_dropout=config.lora_dropout, bias=False)
             return nn.Linear(in_dim, out_dim, bias=False)
 
-        self.wq = get_linear(config.n_embd, config.n_head * self.head_dim)
-        self.wk = get_linear(config.n_embd, self.n_kv_heads * self.head_dim)
-        self.wv = get_linear(config.n_embd, self.n_kv_heads * self.head_dim)
-        self.wo = get_linear(config.n_head * self.head_dim, config.n_embd)
+        self.wq = get_linear(config.n_embd, config.n_head * self.head_dim, is_col=True)
+        self.wk = get_linear(config.n_embd, (config.n_kv_head if config.n_kv_head is not None else config.n_head) * self.head_dim, is_col=True)
+        self.wv = get_linear(config.n_embd, (config.n_kv_head if config.n_kv_head is not None else config.n_head) * self.head_dim, is_col=True)
+        self.wo = get_linear(config.n_head * self.head_dim, config.n_embd, is_col=False)
         self.attn_scale_multiplier = config.attn_scale_multiplier
 
     def repeat_kv(self, x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -268,8 +299,9 @@ class TransformerBlock(nn.Module):
         start_pos: Optional[int] = None,
         kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
     ) -> torch.Tensor:
-        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, start_pos, kv_cache)
-        out = h + self.feed_forward(self.ffn_norm(h))
+        use_triton = getattr(self.feed_forward.config if hasattr(self.feed_forward, 'config') else self.attention.config, 'use_triton', False)
+        h = x + self.attention(self.attention_norm(x, use_triton=use_triton), freqs_cis, mask, start_pos, kv_cache)
+        out = h + self.feed_forward(self.ffn_norm(h, use_triton=use_triton))
         return out
 
 
@@ -346,7 +378,8 @@ class Transformer(nn.Module):
         pixel_values: Optional[torch.Tensor] = None, # Shape: (batch, num_patches, vision_dim)
         targets: Optional[torch.Tensor] = None,
         start_pos: Optional[int] = None,
-        kv_caches: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
+        kv_caches: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        return_all_logits: bool = False
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         _bsz, seqlen = tokens.shape
         
@@ -363,9 +396,16 @@ class Transformer(nn.Module):
             h = torch.cat([h_vision, h], dim=1)
             
         total_seqlen = h.size(1)
+        pos = start_pos if start_pos is not None else 0
+        needed_end = pos + total_seqlen
+        if needed_end > self.freqs_cis.shape[0]:
+            self.freqs_cis = precompute_freqs_cis(
+                dim=self.config.n_embd // self.config.n_head,
+                end=needed_end * 2,
+                scaling_factor=self.config.rope_scaling
+            )
         
         self.freqs_cis = self.freqs_cis.to(tokens.device)
-        pos = start_pos if start_pos is not None else 0
         freqs_cis = self.freqs_cis[pos : pos + total_seqlen]
         
         # 3. Autoregressive multi-modal self-attention layers
@@ -403,7 +443,10 @@ class Transformer(nn.Module):
                 ignore_index=-100
             )
         else:
-            logits = self.output(h[:, [-1], :])
+            if return_all_logits or (start_pos is None and kv_caches is None):
+                logits = self.output(h)
+            else:
+                logits = self.output(h[:, [-1], :])
             loss = None
             
         return logits, loss
@@ -508,25 +551,31 @@ def get_preset_config(size: str = "7B", **kwargs) -> ModelConfig:
 # ==============================================================================
 
 class MultiHeadLatentAttention(nn.Module):
-    """
-    Multi-Head Latent Attention (MLA) from DeepSeek.
-    Compresses Keys and Values into a low-rank latent representation during prefill,
-    massively reducing KV-Cache memory consumption by up to 93%.
-    """
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.n_heads = config.n_head
+        self.config = config
+        from utils.tensor_parallel import ColumnParallelLinear, RowParallelLinear, get_tp_size
+        tp_size = get_tp_size()
+        
+        self.n_heads = config.n_head // tp_size
         self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_head
         self.kv_comp_dim = config.kv_comp_dim
         
-        # 1. KV Latent Compression Layers
+        # 1. KV Latent Compression Layers (kv_down_proj remains replicated)
         self.kv_down_proj = nn.Linear(config.n_embd, self.kv_comp_dim, bias=False)
-        self.kv_up_proj = nn.Linear(self.kv_comp_dim, config.n_head * self.head_dim * 2, bias=False) # Maps to K and V
         
-        # 2. Query Projection
-        self.wq = nn.Linear(config.n_embd, config.n_head * self.head_dim, bias=False)
-        self.wo = nn.Linear(config.n_head * self.head_dim, config.n_embd, bias=False)
+        def get_linear(in_dim, out_dim, is_col=True):
+            if tp_size > 1:
+                if is_col:
+                    return ColumnParallelLinear(in_dim, out_dim, bias=False)
+                else:
+                    return RowParallelLinear(in_dim, out_dim, bias=False)
+            return nn.Linear(in_dim, out_dim, bias=False)
+            
+        self.kv_up_proj = get_linear(self.kv_comp_dim, config.n_head * self.head_dim * 2, is_col=True)
+        self.wq = get_linear(config.n_embd, config.n_head * self.head_dim, is_col=True)
+        self.wo = get_linear(config.n_head * self.head_dim, config.n_embd, is_col=False)
         self.attn_scale_multiplier = config.attn_scale_multiplier
 
     def forward(
@@ -544,18 +593,14 @@ class MultiHeadLatentAttention(nn.Module):
         xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
         
         # 2. Key and Value Latent Compression and Decompression
-        # Project token representations down to compressed latent state
-        latent_kv = self.kv_down_proj(x) # Shape: (bsz, seqlen, kv_comp_dim)
-        
-        # Project latent state up to retrieve Keys and Values
-        decompressed_kv = self.kv_up_proj(latent_kv) # Shape: (bsz, seqlen, n_heads * head_dim * 2)
+        latent_kv = self.kv_down_proj(x)
+        decompressed_kv = self.kv_up_proj(latent_kv)
         k_decomp, v_decomp = torch.chunk(decompressed_kv, 2, dim=-1)
         
         xk = k_decomp.view(bsz, seqlen, self.n_heads, self.head_dim)
         xv = v_decomp.view(bsz, seqlen, self.n_heads, self.head_dim)
         
         # 3. Decoupled RoPE injection
-        # MLA applies positional rotary coordinates to keys and queries before standard attention
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
         
         # 4. Standard Static KV-Cache caching
@@ -567,23 +612,27 @@ class MultiHeadLatentAttention(nn.Module):
             xk = cache_k[:, : start_pos + seqlen]
             xv = cache_v[:, : start_pos + seqlen]
             
-        xq = xq.transpose(1, 2)
-        xk = xk.transpose(1, 2)
-        xv = xv.transpose(1, 2)
-        
-        # Multiply standard scaling by attn_scale_multiplier to sharpen/soften attention maps
-        custom_scale = (1.0 / math.sqrt(self.head_dim)) * self.attn_scale_multiplier
-        
-        # 5. Compute Attention on dynamic KV-Cache
-        output = F.scaled_dot_product_attention(
-            xq, xk, xv, 
-            attn_mask=mask, 
-            dropout_p=0.0, 
-            is_causal=True if mask is None and start_pos is None else False,
-            scale=custom_scale
-        )
-        
-        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        if self.config.use_triton_mla:
+            from utils.triton_kernels import triton_mla_flash_attn
+            scale = 1.0 / math.sqrt(self.head_dim)
+            output = triton_mla_flash_attn(xq, xk, xv, scale, self.attn_scale_multiplier)
+            output = output.view(bsz, seqlen, -1)
+        else:
+            xq = xq.transpose(1, 2)
+            xk = xk.transpose(1, 2)
+            xv = xv.transpose(1, 2)
+            
+            custom_scale = (1.0 / math.sqrt(self.head_dim)) * self.attn_scale_multiplier
+            
+            output = F.scaled_dot_product_attention(
+                xq, xk, xv, 
+                attn_mask=mask, 
+                dropout_p=0.0, 
+                is_causal=True if mask is None and start_pos is None else False,
+                scale=custom_scale
+            )
+            output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+            
         return self.wo(output)
 
 
@@ -592,11 +641,6 @@ class MultiHeadLatentAttention(nn.Module):
 # ==============================================================================
 
 class DeepSeekMoE(nn.Module):
-    """
-    DeepSeekMoE block containing Shared Experts (always active) and fine-grained
-    Routed Experts (dynamically gated). Incorporates Expert Capacity and dynamic 
-    Token Dropping to prevent communication load imbalance during distributed training.
-    """
     def __init__(self, config: ModelConfig, capacity_factor: float = 1.2):
         super().__init__()
         self.num_shared = config.num_shared_experts
@@ -607,11 +651,18 @@ class DeepSeekMoE(nn.Module):
         # 1. Shared Experts (static SwiGLU_MLP modules)
         self.shared_experts = nn.ModuleList([SwiGLU_MLP(config) for _ in range(self.num_shared)])
         
-        # 2. Routed Experts (fine-grained SwiGLU_MLP modules)
-        self.routed_experts = nn.ModuleList([SwiGLU_MLP(config) for _ in range(self.num_routed)])
+        # 2. Routed Experts (partitioned if EP is active)
+        from utils.expert_parallel import ExpertParallelRouter, get_ep_size
+        self.ep_size = get_ep_size()
+        
+        self.experts_per_rank = self.num_routed // self.ep_size
+        self.routed_experts = nn.ModuleList([SwiGLU_MLP(config) for _ in range(self.experts_per_rank)])
         
         # 3. Router Gate (maps hidden state to routing logits)
         self.router = nn.Linear(config.n_embd, self.num_routed, bias=False)
+        
+        if self.ep_size > 1:
+            self.router_parallel = ExpertParallelRouter(self.num_routed)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seqlen, d_model = x.shape
@@ -633,12 +684,6 @@ class DeepSeekMoE(nn.Module):
         # Normalize weights to sum to 1.0 per token
         topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-8)
         
-        # 3. Expert Capacity Limits and Token Dropping
-        expert_capacity = int((num_tokens / self.num_routed) * self.capacity_factor)
-        expert_capacity = max(4, expert_capacity) # Ensure a baseline minimum capacity
-        
-        routed_out = torch.zeros_like(flat_x)
-        
         # Calculate load balancing auxiliary loss (Auxiliary loss) if in training
         if self.training:
             # Fraction of tokens dispatched to each expert
@@ -652,30 +697,37 @@ class DeepSeekMoE(nn.Module):
             # Store aux loss as buffer so parent block can access it
             self.aux_loss = aux_loss
             
-        # Run gated execution with capacity bounds
-        for k in range(self.num_active):
-            weights = topk_weights[:, k] # (total_tokens,)
-            indices = topk_indices[:, k] # (total_tokens,)
+        # Run gated execution
+        if self.ep_size > 1:
+            routed_out = self.router_parallel(flat_x, topk_weights, topk_indices, self.routed_experts)
+        else:
+            expert_capacity = int((num_tokens / self.num_routed) * self.capacity_factor)
+            expert_capacity = max(4, expert_capacity) # Ensure a baseline minimum capacity
             
-            for expert_idx in range(self.num_routed):
-                mask = (indices == expert_idx)
-                token_indices = torch.where(mask)[0]
+            routed_out = torch.zeros_like(flat_x)
+            for k in range(self.num_active):
+                weights = topk_weights[:, k] # (total_tokens,)
+                indices = topk_indices[:, k] # (total_tokens,)
                 
-                if len(token_indices) > 0:
-                    # If exceeding capacity, drop tokens with lowest routing weights
-                    if len(token_indices) > expert_capacity:
-                        # Sort by weights and keep only the top capacity tokens
-                        active_weights = weights[token_indices]
-                        _, sorted_idx = torch.sort(active_weights, descending=True)
-                        keep_indices = token_indices[sorted_idx[:expert_capacity]]
-                    else:
-                        keep_indices = token_indices
-                        
-                    if len(keep_indices) > 0:
-                        expert_tokens = flat_x[keep_indices]
-                        expert_out = self.routed_experts[expert_idx](expert_tokens)
-                        routed_out[keep_indices] += expert_out * weights[keep_indices].unsqueeze(-1)
-                        
+                for expert_idx in range(self.num_routed):
+                    mask = (indices == expert_idx)
+                    token_indices = torch.where(mask)[0]
+                    
+                    if len(token_indices) > 0:
+                        # If exceeding capacity, drop tokens with lowest routing weights
+                        if len(token_indices) > expert_capacity:
+                            # Sort by weights and keep only the top capacity tokens
+                            active_weights = weights[token_indices]
+                            _, sorted_idx = torch.sort(active_weights, descending=True)
+                            keep_indices = token_indices[sorted_idx[:expert_capacity]]
+                        else:
+                            keep_indices = token_indices
+                            
+                        if len(keep_indices) > 0:
+                            expert_tokens = flat_x[keep_indices]
+                            expert_out = self.routed_experts[expert_idx](expert_tokens)
+                            routed_out[keep_indices] += expert_out * weights[keep_indices].unsqueeze(-1)
+                            
         # Blended combination of Shared and Routed experts output
         output = shared_out + routed_out
         return output.view(bsz, seqlen, d_model)

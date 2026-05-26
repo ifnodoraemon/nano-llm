@@ -409,7 +409,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     logger.info(f"Loading checkpoint state from: {args.checkpoint_path}")
-    checkpoint = torch.load(args.checkpoint_path, map_location=device)
+    checkpoint = torch.load(args.checkpoint_path, map_location=device, weights_only=False)
     model_config = checkpoint["config"]
     
     # Instantiate Model
@@ -419,7 +419,9 @@ def main():
     
     # Load tokenizer
     logger.info("Initializing tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B") 
+    from utils.hub_adapter import HubAdapter
+    hub = HubAdapter()
+    tokenizer = hub.load_tokenizer_or_model("Qwen/Qwen2.5-7B" if hub.provider == "hf" else "qwen/Qwen2.5-7B", load_type="tokenizer")
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id or 0
         
@@ -433,7 +435,7 @@ def main():
     # If no baseline is provided, we clone the model configuration to run self-arena representing standard decoding baseline
     if args.baseline_checkpoint_path and os.path.exists(args.baseline_checkpoint_path):
         logger.info(f"Loading baseline checkpoint state from: {args.baseline_checkpoint_path}")
-        base_checkpoint = torch.load(args.baseline_checkpoint_path, map_location=device)
+        base_checkpoint = torch.load(args.baseline_checkpoint_path, map_location=device, weights_only=False)
         baseline_model = Transformer(base_checkpoint["config"]).to(device)
         baseline_model.load_state_dict(base_checkpoint["model_state_dict"])
         baseline_model.eval()

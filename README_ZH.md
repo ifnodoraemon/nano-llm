@@ -67,6 +67,7 @@ graph TD
 | 📡 **[阶段 3 集群遥测健康监控报告](file:///home/ifnodoraemon/.gemini/antigravity-cli/brain/b9731614-1ca7-4068-b098-e69f35aea81a/walkthrough_telemetry.md)** | • 零依赖 CPU/内存/网卡/NVIDIA GPU 指标读取<br>• 宿主机与容器内部完美一致的优雅降级与模拟 fallback<br>• Step logs 与 50 步 ASCII cockpit 仪表盘设计 |
 | 🚀 **[阶段 4 五大维度技术跃升报告](file:///home/ifnodoraemon/.gemini/antigravity-cli/brain/b9731614-1ca7-4068-b098-e69f35aea81a/walkthrough_stage4.md)** | • NCCL 拓扑多网卡自调优与 GPUDirect RDMA 参数配置<br>• 非阻塞异步 Checkpoint 守护线程写与弹性热重启恢复<br>• 工业级 MinHash-LSH 文档近似去重与高精 Heuristic 质量过滤<br>• PagedAttention & Continuous Batching 高并发并发 Serving 实现 |
 | 🌊 **[阶段 5 深水区技术跨越 2.0 报告](file:///home/ifnodoraemon/.gemini/antigravity-cli/brain/b9731614-1ca7-4068-b098-e69f35aea81a/walkthrough_stage5.md)** | • 混合专家路由容量上限（Expert Capacity）与低分 Token 自动丢弃机制<br>• Hopper H800 架构原生 Tensor-wide 激活结合 Channel-wise 权重混合精度 FP8 动态缩放矩阵乘<br>• 基于非阻塞异步 NCCL all-gather-into-tensor 极致遮蔽多网卡间通信与计算重叠延迟<br>• 自动化超长上下文（8K-1M Token）大海捞针（Needle-in-a-Haystack）评测矩阵系统<br>• 基于 GRPO 强化学习的过程监督奖励模型（PRM）子推理步骤计分与无限循环去重去噪机制 |
+| 👑 **[阶段 6 大模型全流程工业级跃升](file:///home/ifnodoraemon/.gemini/antigravity-cli/brain/b9731614-1ca7-4068-b098-e69f35aea81a/walkthrough_stage6.md)** | • Megatron-style ColumnParallel/RowParallel TP 张量并行与 1F1B PP 流水线调度<br>• 共享+路由专家 EP 并行与 SwiGLU/RMSNorm/MLA 极致提速 Triton 融合算子前反向实现<br>• o1 级 MCTS 树搜索推理，融合 UCB1 探索策略、过程监督评估与动态跨 CPU/GPU 坐标对齐<br>• SigLIP 风格 ViT 视觉多模态 Dynamic Patch 图像切块与双层 MLP 投影统一表征<br>• 密集与稀疏（Dense+Sparse BM25）混合 RAG 检索，配合 RRF 倒数排名融合算法<br>• H2O 显存恒定 KV Cache 淘汰（Sinks + Sliding Window），结合 in-place 浅拷贝与自定义 Tokenizer 适配 |
 
 ---
 

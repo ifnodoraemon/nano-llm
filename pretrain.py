@@ -6,11 +6,12 @@ import logging
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
 from model import ModelConfig, Transformer, convert_to_fp8
-from utils.profiler import EstimateStepFlops
+from utils.profiler import estimate_step_flops, calculate_mfu
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -33,6 +34,11 @@ def main():
     parser.add_argument("--use_fp8", type=str, default="True", help="Enable Native float8 matrix multiplication mapping")
     parser.add_argument("--data_dir", type=str, default="./data", help="Directory containing packed train.bin and val.bin")
     parser.add_argument("--out_dir", type=str, default="./outputs", help="Directory to save pre-trained checkpoints")
+    parser.add_argument("--tp_size", type=int, default=1, help="Tensor Parallel size")
+    parser.add_argument("--pp_size", type=int, default=1, help="Pipeline Parallel size")
+    parser.add_argument("--ep_size", type=int, default=1, help="Expert Parallel size")
+    parser.add_argument("--use_triton_mla", type=str, default="False", help="Use Triton MLA kernel")
+    parser.add_argument("--use_triton", type=str, default="False", help="Use Triton RMSNorm and SwiGLU kernels")
     args = parser.parse_args()
 
     # 0. Initialize hardware telemetry monitor
@@ -58,6 +64,26 @@ def main():
         torch.cuda.set_device(device)
         master_process = ddp_rank == 0
         seed_offset = ddp_rank
+        
+        # Initialize 3D Parallel groups
+        from utils.tensor_parallel import init_tp_process_group
+        from utils.pipeline_parallel import init_pp_process_group
+        from utils.expert_parallel import init_ep_process_group
+        
+        init_tp_process_group(args.tp_size)
+        init_pp_process_group(args.pp_size)
+        init_ep_process_group(args.ep_size)
+        
+        # Initialize DP Process Groups
+        dp_size = ddp_world_size // (args.tp_size * args.pp_size)
+        dp_group = None
+        if dp_size > 1:
+            for tp in range(args.tp_size):
+                for pp in range(args.pp_size):
+                    dp_ranks = [dp * (args.pp_size * args.tp_size) + pp * args.tp_size + tp for dp in range(dp_size)]
+                    group = dist.new_group(dp_ranks)
+                    if ddp_rank in dp_ranks:
+                        dp_group = group
     else:
         # Fallback to single GPU or CPU
         ddp_rank = 0
@@ -95,10 +121,11 @@ def main():
     train_data = np.memmap(train_bin, dtype=np.uint16, mode="r")
     val_data = np.memmap(val_bin, dtype=np.uint16, mode="r")
 
-    def get_batch(split):
+    def get_batch(split, batch_size=None):
         data = train_data if split == "train" else val_data
+        bs = batch_size if batch_size is not None else args.batch_size
         # Select random starting token indexes
-        ix = torch.randint(len(data) - args.block_size - 1, (args.batch_size,))
+        ix = torch.randint(len(data) - args.block_size - 1, (bs,))
         x = torch.stack([torch.from_numpy((data[i : i + args.block_size]).astype(np.int64)) for i in ix])
         y = torch.stack([torch.from_numpy((data[i + 1 : i + 1 + args.block_size]).astype(np.int64)) for i in ix])
         
@@ -112,11 +139,16 @@ def main():
     # 3. Build model Config & Model
     config = ModelConfig(
         block_size=args.block_size,
-        vocab_size=1200, # vocab size of custom trained tokenizer
+        vocab_size=10005,
         n_layer=4,       # Light config for fast startup & pre-training stability
         n_head=8,
         n_embd=512,
-        vision_dim=None  # Pure Causal Text Pre-training
+        vision_dim=None,  # Pure Causal Text Pre-training
+        tp_size=args.tp_size,
+        pp_size=args.pp_size,
+        ep_size=args.ep_size,
+        use_triton_mla=args.use_triton_mla.lower() == "true",
+        use_triton=args.use_triton.lower() == "true"
     )
     
     model = Transformer(config)
@@ -145,9 +177,34 @@ def main():
     ]
     optimizer = torch.optim.AdamW(optim_groups, lr=args.lr, betas=(0.9, 0.95), eps=1e-8)
 
-    # 5. Shard model through DDP
-    if ddp:
-        model = DDP(model, device_ids=[ddp_local_rank])
+    # 5. Shard model through DDP or Pipeline Parallel
+    from utils.pipeline_parallel import PipelineStage, OneFOneBScheduler, get_pp_size, get_pp_rank
+    pp_size = get_pp_size()
+    pp_rank = get_pp_rank()
+    
+    if pp_size > 1:
+        # Slice layers for current PP stage
+        num_layers = len(model.layers)
+        layers_per_stage = num_layers // pp_size
+        start_idx = pp_rank * layers_per_stage
+        end_idx = start_idx + layers_per_stage if pp_rank < pp_size - 1 else num_layers
+        
+        local_layers = nn.ModuleList([model.layers[i] for i in range(start_idx, end_idx)])
+        tok_embeddings = model.tok_embeddings if pp_rank == 0 else None
+        head_wrapper = nn.Sequential(model.norm, model.output) if pp_rank == pp_size - 1 else None
+        
+        stage = PipelineStage(local_layers, embedding=tok_embeddings, head=head_wrapper, freqs_cis=model.freqs_cis)
+        scheduler = OneFOneBScheduler(stage, num_microbatches=args.grad_accum_steps, d_model=config.n_embd)
+        
+        if ddp and dp_size > 1:
+            stage = DDP(stage, device_ids=[ddp_local_rank], process_group=dp_group)
+        model_to_opt = stage
+    else:
+        stage = None
+        scheduler = None
+        if ddp and dp_size > 1:
+            model = DDP(model, device_ids=[ddp_local_rank], process_group=dp_group)
+        model_to_opt = model
 
     # Auto-detect checkpoint to self-heal and hot-restore on failure
     has_ckpt, restored_step, restored_epoch = restore_mgr.auto_detect_checkpoint()
@@ -173,13 +230,15 @@ def main():
     t0 = time.time()
 
     # Pre-calculate steps flops for real-time MFU reporting
-    raw_model = model.module if ddp else model
-    step_flops = EstimateStepFlops(
+    raw_model = model_to_opt.module if hasattr(model_to_opt, "module") else model_to_opt
+    n_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
+    step_flops = estimate_step_flops(
+        n_parameters=n_params,
         batch_size=args.batch_size * ddp_world_size * args.grad_accum_steps,
         seq_len=args.block_size,
         n_layer=config.n_layer,
         n_embd=config.n_embd,
-        vocab_size=config.vocab_size
+        n_head=config.n_head
     )
 
     if master_process:
@@ -195,29 +254,45 @@ def main():
         optimizer.zero_grad(set_to_none=True)
         loss_accum = 0.0
 
-        for micro_step in range(args.grad_accum_steps):
-            x, y = get_batch("train")
+        if pp_size > 1:
+            # Slice input batch into micro-batches for 1F1B
+            x, y = get_batch("train", batch_size=args.batch_size * args.grad_accum_steps)
+            micro_batches_x = list(x.chunk(args.grad_accum_steps, dim=0))
+            micro_batches_y = list(y.chunk(args.grad_accum_steps, dim=0))
             
-            # Disable DDP gradient sync on intermediate micro-steps
-            if ddp:
-                model.require_backward_grad_sync = (micro_step == args.grad_accum_steps - 1)
+            def loss_fn(pred_logits, targets_mb):
+                return F.cross_entropy(pred_logits.view(-1, pred_logits.size(-1)), targets_mb.view(-1), ignore_index=-100)
                 
-            # Forward pass under native bfloat16 AMP
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                logits, loss = model(x, targets=y)
-                loss = loss / args.grad_accum_steps
+                losses = scheduler.run_1f1b(
+                    micro_batches=micro_batches_x,
+                    targets=micro_batches_y,
+                    loss_fn=loss_fn,
+                    device=torch.device(device)
+                )
                 
-            loss_accum += loss.detach().item()
-            
-            # Backward pass
-            loss.backward()
+            loss_accum = sum(l.detach().item() for l in losses) / args.grad_accum_steps if losses else 0.0
+        else:
+            for micro_step in range(args.grad_accum_steps):
+                x, y = get_batch("train")
+                
+                # Disable DDP gradient sync on intermediate micro-steps
+                if ddp:
+                    model.require_backward_grad_sync = (micro_step == args.grad_accum_steps - 1)
+                    
+                # Forward pass under native bfloat16 AMP
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    logits, loss = model(x, targets=y)
+                    loss = loss / args.grad_accum_steps
+                    
+                loss_accum += loss.detach().item()
+                
+                # Backward pass
+                loss.backward()
 
         # Clip global gradient norm
         if args.grad_clip > 0.0:
-            if ddp:
-                torch.nn.utils.clip_grad_norm_(model.module.parameters(), args.grad_clip)
-            else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            torch.nn.utils.clip_grad_norm_(model_to_opt.parameters(), args.grad_clip)
 
         # Optimization step
         optimizer.step()

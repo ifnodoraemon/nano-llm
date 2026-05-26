@@ -78,17 +78,20 @@ class TestDataModules(unittest.TestCase):
         self.assertEqual(sample["labels"].ndim, 1)
         
         # User input parts of labels must be masked with -100
-        user_tokens_len = len(self.tokenizer.encode("<|im_start|>user\nHello<|im_end|>\n", add_special_tokens=False))
+        try:
+            user_tokens_len = len(self.tokenizer.encode("<|im_start|>user\nHello<|im_end|>\n", add_special_tokens=False))
+        except TypeError:
+            user_tokens_len = len(self.tokenizer.encode("<|im_start|>user\nHello<|im_end|>\n"))
         self.assertEqual(sample["labels"][:user_tokens_len].tolist(), [-100] * user_tokens_len)
 
     def test_sequence_packing_collator(self):
         dataset = SFTDataset(self.tmp_sft_path, self.tokenizer, max_length=128)
-        collator = SequencePackingCollator(pad_token_id=0, max_length=64)
+        collator = SequencePackingCollator(pad_token_id=0, max_length=256)
         
         batch = collator([dataset[0], dataset[1]])
-        self.assertEqual(batch["input_ids"].shape, (1, 64)) # Packed into 1 sequence of length 64
-        self.assertEqual(batch["labels"].shape, (1, 64))
-        self.assertEqual(batch["position_ids"].shape, (1, 64))
+        self.assertEqual(batch["input_ids"].shape, (1, 256)) # Packed into 1 sequence of length 256
+        self.assertEqual(batch["labels"].shape, (1, 256))
+        self.assertEqual(batch["position_ids"].shape, (1, 256))
 
     def test_dpo_dataset_loading(self):
         dataset = DPODataset(self.tmp_dpo_path, self.tokenizer, max_prompt_length=64, max_length=128)

@@ -11,7 +11,7 @@ class TestSearchAndEvictionUpgrades(unittest.TestCase):
     def setUp(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.config = ModelConfig(
-            dim=64,
+            n_embd=64,
             n_layer=1,
             n_head=2,
             vocab_size=500,
@@ -49,8 +49,17 @@ class TestSearchAndEvictionUpgrades(unittest.TestCase):
         """
         Verify ReasoningNode traceback and SearchTreeDecoder branching decode steps.
         """
-        tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        tokenizer.pad_token = tokenizer.eos_token
+        class MockTokenizer:
+            def __init__(self):
+                self.pad_token = "<pad>"
+                self.eos_token = "<eos>"
+                self.eos_token_id = 0
+            def decode(self, tokens, skip_special_tokens=True):
+                if isinstance(tokens, torch.Tensor):
+                    tokens = tokens.tolist()
+                return " ".join(str(t) for t in tokens)
+                
+        tokenizer = MockTokenizer()
         
         prompt_ids = torch.randint(1, self.config.vocab_size, (1, 8), device=self.device)
         

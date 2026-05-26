@@ -20,7 +20,6 @@ class FP8FlashAttention3(nn.Module):
         self.block_size = block_size  # SRAM block capacity limit (tile size)
         self.scale = 1.0 / (head_dim ** 0.5)
 
-    @torch.compile(fullgraph=False)  # Trigger PyTorch 2.0+ Inductor Compiler!
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attn_scale_multiplier: float = 1.0) -> torch.Tensor:
         """
         q, k, v shapes: [Batch, Num_heads, Seq_len, Head_dim]

@@ -65,7 +65,10 @@ class SFTDataset(Dataset):
         for msg in messages:
             role = msg["role"]
             formatted_text = self.formatter.format_message(msg)
-            tokens = self.tokenizer.encode(formatted_text, add_special_tokens=False)
+            try:
+                tokens = self.tokenizer.encode(formatted_text, add_special_tokens=False)
+            except TypeError:
+                tokens = self.tokenizer.encode(formatted_text)
             
             input_ids.extend(tokens)
             
@@ -199,7 +202,10 @@ class DPODataset(Dataset):
         for msg in item["prompt"]:
             prompt_text += self.formatter.format_message(msg)
             
-        prompt_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
+        try:
+            prompt_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
+        except TypeError:
+            prompt_ids = self.tokenizer.encode(prompt_text)
         if len(prompt_ids) > self.max_prompt_length:
             prompt_ids = prompt_ids[-self.max_prompt_length:] # Keep latest turns
             
@@ -207,8 +213,14 @@ class DPODataset(Dataset):
         chosen_text = self.formatter.format_message(item["chosen"])
         rejected_text = self.formatter.format_message(item["rejected"])
         
-        chosen_ids = self.tokenizer.encode(chosen_text, add_special_tokens=False)
-        rejected_ids = self.tokenizer.encode(rejected_text, add_special_tokens=False)
+        try:
+            chosen_ids = self.tokenizer.encode(chosen_text, add_special_tokens=False)
+        except TypeError:
+            chosen_ids = self.tokenizer.encode(chosen_text)
+        try:
+            rejected_ids = self.tokenizer.encode(rejected_text, add_special_tokens=False)
+        except TypeError:
+            rejected_ids = self.tokenizer.encode(rejected_text)
         
         # Combine prompt with chosen & rejected up to max_length
         max_ans_len = self.max_length - len(prompt_ids)
@@ -279,7 +291,10 @@ class MultimodalSFTDataset(Dataset):
         for msg in messages:
             role = msg["role"]
             formatted_text = self.formatter.format_message(msg)
-            tokens = self.tokenizer.encode(formatted_text, add_special_tokens=False)
+            try:
+                tokens = self.tokenizer.encode(formatted_text, add_special_tokens=False)
+            except TypeError:
+                tokens = self.tokenizer.encode(formatted_text)
             
             input_ids.extend(tokens)
             

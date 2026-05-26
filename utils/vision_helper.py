@@ -1,6 +1,8 @@
 import urllib.request
 import logging
 import torch
+import os
+from typing import Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -97,3 +99,47 @@ def extract_image_features(
     except Exception as e:
         logger.error(f"Image feature extraction failed with error: {e}. Utilizing simulated features.")
         return torch.randn(num_patches, vision_dim, device=device)
+
+
+class DynamicPatchProcessor:
+    """
+    Dynamic Resolution Patch Processor (SigLIP style).
+    Takes arbitrary resolution images and maps them to a dynamic grid of patches,
+    supporting high-resolution grids from 224x224 up to 1344x1344.
+    """
+    def __init__(self, patch_size: int = 14, min_size: int = 224, max_size: int = 1344):
+        self.patch_size = patch_size
+        self.min_size = min_size
+        self.max_size = max_size
+
+    def process_dynamic_resolution(self, width: int, height: int) -> Tuple[int, int]:
+        """
+        Dynamically calculates the optimal grid resolution dimensions based on original image shape.
+        """
+        # Clamp original size to min/max boundaries
+        w_scaled = max(self.min_size, min(self.max_size, (width // self.min_size) * self.min_size))
+        h_scaled = max(self.min_size, min(self.max_size, (height // self.min_size) * self.min_size))
+        
+        return w_scaled, h_scaled
+
+    def extract_patches(self, image_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Extracts patch-grid tensors dynamically from a preprocessed image tensor.
+        image_tensor: [3, H, W]
+        Returns: [num_patches, patch_dim]
+        """
+        channels, height, width = image_tensor.shape
+        
+        # Calculate matching grid coordinates
+        grid_h = height // self.patch_size
+        grid_w = width // self.patch_size
+        num_patches = grid_h * grid_w
+        
+        # Unfold image into patches
+        # [3, grid_h, patch_size, grid_w, patch_size] -> [num_patches, 3 * patch_size * patch_size]
+        patches = image_tensor.unfold(1, self.patch_size, self.patch_size).unfold(2, self.patch_size, self.patch_size)
+        patches = patches.permute(1, 3, 0, 2, 4).contiguous()
+        patches = patches.view(num_patches, channels * self.patch_size * self.patch_size)
+        
+        return patches
+

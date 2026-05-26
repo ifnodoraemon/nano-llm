@@ -124,7 +124,9 @@ def train():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # 2. Tokenizer & Dataset Loader
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B", use_fast=True) # or config folder
+    from utils.hub_adapter import HubAdapter
+    hub = HubAdapter()
+    tokenizer = hub.load_tokenizer_or_model("Qwen/Qwen2.5-7B" if hub.provider == "hf" else "qwen/Qwen2.5-7B", load_type="tokenizer", use_fast=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id or 0
 
@@ -163,7 +165,7 @@ def train():
 
     # 3. Load Policy and Reference Models
     logger.info(f"Loading base checkpoint config from {args.sft_checkpoint_path}...")
-    checkpoint = torch.load(args.sft_checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(args.sft_checkpoint_path, map_location="cpu", weights_only=False)
     model_config = checkpoint["config"]
     
     logger.info("Initializing POLICY Model...")

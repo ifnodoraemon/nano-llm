@@ -18,9 +18,18 @@ def autotune_nccl():
     except Exception:
         pass
         
-    has_ib = any("ib" in iface for iface in interfaces)
-    has_roce = any("roce" in iface or "mlx" in iface for iface in interfaces)
-    eth_interfaces = [iface for iface in interfaces if iface.startswith(("eth", "en", "wl"))]
+    active_interfaces = []
+    for iface in interfaces:
+        try:
+            with open(f"/sys/class/net/{iface}/operstate", "r") as f:
+                if f.read().strip() == "up":
+                    active_interfaces.append(iface)
+        except Exception:
+            active_interfaces.append(iface)
+            
+    has_ib = any("ib" in iface for iface in active_interfaces)
+    has_roce = any("roce" in iface or "mlx" in iface for iface in active_interfaces)
+    eth_interfaces = [iface for iface in active_interfaces if iface.startswith(("eth", "en", "wl", "bond"))]
     
     # Autotuned environment variables mapping
     tuned_vars = {
