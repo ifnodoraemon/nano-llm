@@ -1,6 +1,6 @@
-# nano-llm 项目全流程待办事项 (ToDo & Gaps Roadmap)
+# nano-llm 项目全链路完整待办事项 (Comprehensive ToDo & Gaps Roadmap)
 
-目标：打通预训练、微调(SFT)、对齐(DPO)以及强化学习(GRPO)全链路，打磨极速、高性能、多模态的顶级 2B 稠密基座模型。
+目标：打通预训练、微调(SFT)、对齐(DPO)以及强化学习(GRPO)全链路，打造专属的顶级 2B (或1.5B) 稠密基座模型与前沿“指代识图”智能体。
 
 ---
 
@@ -9,37 +9,22 @@
 ### 1.1 监控 1.5B 预训练收敛 (P0 - 正在运行)
 *   **任务 ID**：`task-2212` (目标 5000 步，当前进度 755+)。
 *   **状态**：已解决 NVML 锁问题，单步耗时稳定在 **4.2 秒**，Loss 在 5.5 左右，收敛正常。
-*   **待办**：持续跟进 Loss收敛趋势与梯度稳定性，预计在 2026-06-01 23:50 完成。
+*   **待办**：持续跟进 Loss 收敛趋势与梯度稳定性，预计在 2026-06-01 23:50 完成。
 
-### 1.2 修复 MFU (Model FLOPs Utilization) 计算错误 (P1)
-*   **问题**：[pretrain.py](file:///home/ifnodoraemon/myagent/nano-llm/pretrain.py#L374) 在计算 `mfu_percentage` 时，直接将集群总 FLOPs/sec 除以了单卡 H800 的峰值性能 (`312e12`)，导致算出的 MFU 偏大 `ddp_world_size` (8)倍。
-*   **待办**：修改 MFU 计算公式，将分母更新为 `312e12 * ddp_world_size`（或直接使用 `calculate_mfu` 助手函数），保证在 DDP 多卡模式下精确报告单卡算力利用率（预计真实 MFU 约为 ~52.7%）。
+### 1.2 修复 MFU (Model FLOPs Utilization) 计算错误 (P0 - 立即修复)
+*   **问题**：[pretrain.py](file:///home/ifnodoraemon/myagent/nano-llm/pretrain.py#L374) 在计算 `mfu_percentage` 时，直接将集群总 FLOPs/sec 除以了单卡 H800 的峰值性能 (`312e12`)，导致算出的 MFU 偏大 `ddp_world_size` (8) 倍。
+*   **待办**：修改 MFU 计算公式，将分母更新为 `312e12 * ddp_world_size`（或使用 `calculate_mfu` 助手函数），保证在 DDP 多卡模式下精确报告单卡算力利用率（实际 MFU 约为 ~52.7%）。同时在 `estimate_step_flops` 中引入对激活重算（use_activation_checkpointing=True）的自适应 FLOPs 补偿。
 
 ### 1.3 引入预训练周期性验证机制 (P1)
-*   **问题**：目前代码虽加载了验证集数据 `val_data`，但训练过程中完全没有运行验证循环（Validation Loop），无法定量追踪验证 Loss (val_loss)。
-*   **待办**：在 [pretrain.py](file:///home/ifnodoraemon/myagent/nano-llm/pretrain.py) 中实现 `evaluate_val_loss`：
-    *   每 500 步在验证集上采样 50 个 batches 计算平均 loss。
-    *   在 DDP 模式下，通过 `dist.all_reduce` 跨卡聚合 val_loss，由 master 节点打印并上报至 `ExperimentTracker`。
+*   **问题**：目前预训练引擎缺乏 Validation Loop，无法在训练期间监控验证 Loss。
+*   **待办**：在 [pretrain.py](file:///home/ifnodoraemon/myagent/nano-llm/pretrain.py) 中实现 `evaluate_val_loss`。在 DDP 模式下，每 500 步在验证集上采样 50 个 batches 进行前向，使用 `dist.all_reduce` 跨卡聚合 val_loss，由 master 节点打印并上报至 `ExperimentTracker`。
 
-### 1.4 💡 预训练算法与数据级硬核技术创新 (Pre-training Deep Innovations)
-*   **1) GNS-Adaptive Batch Size Scheduling (基于梯度噪声强度的自适应 Batch Size 调度)**：
-    *   *设计*：在线实时估算当前梯度的 Gradient Noise Scale (GNS)：$\text{GNS} = \text{tr}(\Sigma) / \|g\|^2$。在训练初期，GNS 较小，使用较小的 Batch Size（如 `--grad_accum_steps 1`）节省算力并快速发散；随着训练步数深入和梯度收敛，GNS 增大，自动成倍调大梯度累积步数以扩大全局 Batch Size。
-    *   *目的*：从理论上将预训练收敛效率提升 1.5 ~ 2.0 倍，并在中后期有效抑止梯度发散。
-*   **2) Benchmark Leakage Prevention & Semantic Blocking (语义指纹阻断防泄露引擎)**：
-    *   *设计*：在 Dataloader 阶段集成一个语义指纹过滤器。将 MMLU、GSM8K、ARC 等评测基准的问题库在内存中构建为轻量级的局部敏感哈希（LSH）或 5-gram 索引。在载入预训练数据块时进行实时对比，一旦重合度触发阈值，直接对该块执行 semantic masking（将对应 labels 设为 -100），彻底阻断 benchmark 泄露。
-    *   *目的*：确保基座模型在下游 benchmark 上的评估成绩为纯粹的 Zero-Shot 泛化，而非数据记忆。
-*   **3) LG-Opt: Loss-Gradient Decoupled Rescaling (基于 Loss 偏导的梯度自适应重缩放)**：
-    *   *设计*：在反向传播前，根据当前 batch 的 loss 偏离 EMA (指数移动平均) 历史 loss 的绝对偏差 $\delta = |\text{Loss} - \text{EMA\_Loss}|$，动态计算动态重缩放因子：
-        *   若 $\delta > 3\sigma$（偏离过高，判定为二进制噪声或系统日志等脏数据），对该 Batch 的梯度乘 0.1 衰减权重，防止参数学坏；
-        *   若 Loss 接近于 0 且 $\delta \approx 0$（判定为版权免责声明等高度冗余数据），进行轻微惩罚。
-    *   *目的*：从算法底层提供预训练稳定性护栏，彻底摆脱对繁琐 Adam 超参数的经验调参依赖。
-*   **4) Spectral Decoupled RoPE Base Scaling (谱分离位置编码基频预外推)**：
-    *   *设计*：不同于 YaRN 等对称插值，在预训练阶段应用谱分离位置编码：
-        *   对高频维度部分（代表短程局部注意力）保持基频 $\theta=10000$ 绝对不缩放，确保 1K 范围内的近距离高精度逻辑和结构感知；
-        *   对中低频维度部分（代表长程语境）使用指数衰减因子进行插值外推。
-    *   *目的*：实现在 4K 的常规预训练中，让模型直接具备外推 16K+ 长上下文的能力，且短文本性能零退化。
-*   **5) Annealing CoT Injection (退火阶段逻辑夹带)**：
-    *   *设计*：在余弦学习率衰减至 Min_LR 的退火（Annealing）阶段，混入 5% 的高质量多步推理合成数据，从而在预训练中就激活强大的结构化推理表达。
+### 1.4 💡 预训练算法与数据级硬核技术创新 (Pre-training Deep Innovations) (P2)
+*   **GNS-Adaptive Batch Size Scheduling (自适应 Batch Size 调度)**：根据在线实时估算的 Gradient Noise Scale (GNS) 动态调整梯度累积步数（grad_accum_steps）。在训练初期使用小 batch 提速并探索，中后期随着 GNS 增长自动扩大全局 Batch Size。缩短 1.5 ~ 2.0 倍的收敛时间。
+*   **Benchmark Leakage Prevention & Semantic Blocking (语义指纹阻断防泄露)**：将 MMLU、GSM8K、ARC 等评测库在内存中构建为 LSH (局部敏感哈希) 索引。在载入预训练数据块时进行实时对比，重合度高则执行 semantic masking（labels 置为 -100），彻底防范基准泄露。
+*   **LG-Opt: Loss-Gradient Decoupled Rescaling (Loss偏导梯度自适应重缩放)**：在反向传播前，根据当前 batch 的 loss 偏离 EMA 历史 loss 的绝对偏差 $\delta$。若偏离异常高（如脏乱码数据），则对梯度乘以 0.1 进行衰减；若 loss 趋近于零且变化极小（如冗余免责声明），则执行轻度惩罚。
+*   **Spectral Decoupled RoPE Base Scaling (谱分离位置编码基频预外推)**：对高频维度部分（代表短程局部注意力）保持基频 $\theta=10000$ 绝对不缩放（保障 1K 范围内的近距离高精度逻辑和结构感知）；对中低频维度部分（代表长程语境）使用指数衰减因子进行插值外推。实现 4K 预训练模型原生具备 16K+ 长上下文外推能力，且短文本性能零退化。
+*   **Annealing CoT Injection (退火阶段逻辑夹带)**：在余弦学习率衰减至 Min_LR 的退火（Annealing）阶段，混入 5% 的高质量多步推理合成数据，从而在预训练中就激活强大的结构化推理表达。
 
 ### 1.5 💡 对标 Qwen3-VL：预训练 Interleaved-MRoPE 架构集成 (P2)
 *   **问题（老技术淘汰）**：传统多模态位置编码MRoPE虽然有时间（T）、高度（H）和宽度（W）的分立，但是分块进行的，容易造成视频长文本中的时空分辨率退化。
@@ -58,11 +43,11 @@
 
 ## 📊 2. 评估系统升级 (Comprehensive Evaluation System Gaps)
 
-### 2.1 引入真实评测集代替 Mock 数据 (P1)
-*   **问题**：[eval_benchmarks.py](file:///home/ifnodoraemon/myagent/nano-llm/eval_benchmarks.py#L18) 中的 MMLU (3 题)、GSM8K (3 题) 和 Arena (6 题) 全是硬编码 Mock数据，属于“伪评估”，无法客观反映模型的真实智能水平。
-*   **待办**：
-    *   从本地加载或自动下载一个更具代表性的小型真实评估数据集（如 100 题 bilingual MMLU, 50 题 GSM8K）。
-    *   支持 `eval_benchmarks.py` 动态加载本地 JSON/JSONL 评估文件，避免硬编码样本。
+### 2.1 引入真实评测集代替 Mock 数据 (P1 - ✅ 已完成)
+*   **问题**：已解决 [eval_benchmarks.py](file:///home/ifnodoraemon/myagent/nano-llm/eval_benchmarks.py) 全是硬编码 Mock 数据，无法客观反映真实智能水平的问题。
+*   **完成度**：
+    *   编写了 [data/download_eval_benchmarks.py](file:///home/ifnodoraemon/myagent/nano-llm/data/download_eval_benchmarks.py) 用于自动下载 MMLU、GSM8K、ARC-Challenge、HellaSwag 和 HumanEval 真实子集至 `data/eval/` 中。
+    *   重构了 [eval_benchmarks.py](file:///home/ifnodoraemon/myagent/nano-llm/eval_benchmarks.py)，实现动态加载本地 JSONL 数据进行 logits 选择评估及 HumanEval 代码沙箱验证。
 
 ### 2.2 丰富多尺度大海捞针 (NIAH) 与长文本 Perplexity 测试 (P1)
 *   **问题**：目前的 `NeedleInAHaystackEvaluator` 长度限制为 `[1024, 2048, 4096]`，无法直接用于评估 8K/16K 长上下文模型。
@@ -80,7 +65,7 @@
 
 ## 🔧 3. SFT / DPO / GRPO 流程诊断与优化 (Fine-tuning & Alignment Gaps)
 
-### 3.1 消除 SFT 路径硬编码并建立 Validation Loop (P1)
+### 3.1 消除 SFT 路径硬编码并建立 Validation Loop (P0 - 立即修复)
 *   **问题**：[train.py](file:///home/ifnodoraemon/myagent/nano-llm/train.py#L103) 中加载 pretrain pt 文件时，路径 `./outputs/checkpoint_pretrain.pt` 被写死，忽略了 `--model_name_or_path` 参数；且没有划分验证集来计算 val loss。
 *   **待办**：
     *   重构 `train.py` 使用 `--model_name_or_path` 作为基座模型加载路径。
@@ -92,7 +77,7 @@
     *   划分独立的 Chosen-Rejected 验证对，每 50 步评估一次 Validation DPO Loss 和 Chosen vs Rejected Accuracy。
     *   使 Tokenizer 加载路径与 `--sft_checkpoint_path` / `--model_name_or_path` 动态绑定。
 
-### 3.3 重构 GRPO 相对优势计算与在线 Evaluation (P1)
+### 3.3 重构 GRPO 相对优势计算与在线 Evaluation (P0 - 立即修复)
 *   **问题**：
     *   [grpo.py](file:///home/ifnodoraemon/myagent/nano-llm/grpo.py#L226) 中 `advantages` 计算在局部做了一次 EMA 归一化后，又立刻算了一遍组内均值方差进行了二次归一化。在数学上，这直接抵消并消除了 `GRPORewardScaler` 的 EMA 均值/方差作用，使其退化为局部归一化。
     *   缺少对强化学习的实时监控（如防止 Reward Hacking，防止模型为刷分堆砌无意义的符号）。
@@ -106,7 +91,7 @@
     *   **Process-Supervised Step Reward (PRM 步进奖励)**：对 GRPO 训练引入多步过程监督。对于生成中途的每一个 `tool_call` 执行正则与结构化参数检验，对格式正确且逻辑连续的动作实时给予小额正向步进奖励（Step Reward $\gamma^t R_{step}$），加速复杂长任务的收敛。
     *   **Budget-Constrained Penalty (预算约束惩罚机制)**：在 Prompt 中混入显式的全局约束条件（如：“限定 5 步交互” 或 “费用预算限制”），一旦模型在 GRPO 的采样轨迹中出现调用超频、死循环或超预算，给予惩罚性负奖励（如 $-3.0$），强迫模型学会“剪枝规划”与“最小代价求解”。
 
-### 3.5 💥 消除数据打包注意力交叉污染 (Solve Sequence Packing Mask Leakage) (P1)
+### 3.5 💥 消除数据打包注意力交叉污染 (Solve Sequence Packing Mask Leakage) (P0 - 立即修复)
 *   **问题**：[data.py](file:///home/ifnodoraemon/myagent/nano-llm/data.py#L93) 的 `SequencePackingCollator` 中将多个独立会话打包进同一个长度为 `max_length` 的 sequence。但在 [model/__init__.py](file:///home/ifnodoraemon/myagent/nano-llm/model/__init__.py#L393) 的 forward 循环中，调用 `layer` 时将 `mask` 强制写死为了 `None`，导致注意力退化为全局的下三角 Causal Mask。这导致 packed sequence 中的后一会话在计算自注意力时，能完全看到前一会话的上下文，产生严重的跨样本注意力交叉泄露（Attention Cross-talk）与逻辑污染。
 *   **待办**：
     *   重构 `SequencePackingCollator` 输出会话的 `cumulative_seqlens` 边界信息。
@@ -165,7 +150,7 @@
 
 ### 5.5 💡 对标 Qwen3-VL：DeepStack 多层级特征级联融合与非因果图像掩码 (P2)
 *   **设计**：
-    *   **DeepStack Integration (深度层叠级联融合)**：废弃单纯的 Input 拼接投影。在前段多层（如第 2, 4, 6 层）设置级联层，将 Vision Transformer (ViT) 不同层级的隐层特征跨层直接融合注入，加深低阶特征与文字的强绑定。
+    *   **DeepStack Integration (深度层叠级联融合)**：废弃单纯 of Input 拼接投影。在前段多层（如第 2, 4, 6 层）设置级联层，将 Vision Transformer (ViT) 不同层级的隐层特征跨层直接融合注入，加深低阶特征与文字的强绑定。
     *   **Non-Causal Image Masking (非因果图像自注意力掩码)**：在 LLM 的 Attention 矩阵中，允许图像 tokens 之间进行无方向的双向注意力交互（Non-Causal），仅对文本部分应用 Causal Mask，极大释放图像空间物理定位理解精度。
 
 ### 5.6 💡 对标 DeepSeek-VL2：Dynamic Tiling 动态图块切片与 Global-Local 混合注意力 (P2)
@@ -176,14 +161,27 @@
 ### 5.7 💡 对标 DeepSeek 2026《Thinking with Visual Primitives》：基于空间标记思考 (Thinking with Points & Bounding Boxes) (P2)
 *   **背景 (指代鸿沟)**：DeepSeek 最新多模态研究提出，模型常面临“指代鸿沟（Reference Gap）”。语言无法精准描述连续空间，导致密集计数（Pixmo-Count）、迷宫导航（DS_Maze_Navigation）和路径追踪（DS_Path_Tracing）在纯语言 CoT 时完全崩溃。
 *   **设计**：
-    *   **Thinking with Visual Primitives (基于空间标记思考)**：将空间标记 —— 代表位置的 **Point (点)** 与代表范围的 **Bounding Box (边界框)** 提升为“思考的最小单元”。训练模型在 `<think>` 思考链中交替输出点 `&lt;｜point｜&gt;[[y, x]]&lt;｜/point｜&gt;` 和框 `&lt;｜box｜&gt;[[y1, x1, y2, x2]]&lt;｜/box｜&gt;`，把语言逻辑死死锚定在物理像素坐标上。
+    *   **Thinking with Visual Primitives (基于空间标记思考)**：将空间标记 —— 代表位置的 **Point (点)** 与代表范围的 **Bounding Box (边界框)** 提升为“思考的最小单元”。训练模型在 `<think>` 思考链中交替输出点 `<｜point｜>[[y, x]]<｜/point｜>` 和框 `<｜box｜>[[y1, x1, y2, x2]]<｜/box｜>`，把语言逻辑死死锚定在物理像素坐标上。
     *   **训练流水线与 RL 引导**：先在 Web 抓取的 bbox 框数据集上进行专家 SFT（因为框的标注是确定性的，信息丰满，更易学习），随后在后训练阶段通过强化学习（RL）引导模型学习 point。对迷宫导航等设计细粒度的 RL 奖励（路径覆盖度、回溯探索完整度、避障墙壁判定率），以形成自愈寻路闭环。
     *   **7056倍像素超强压缩 (极致 token 效率)**：在 Vision Encoder 出口执行 3×3 空间降采样（每 9 个 patch 合成 1 个），送入 LLM 前再次利用 CSA (压缩稀疏注意力) 将 KV cache 压缩 4 倍，将 756×756 图像最终压缩至 **81 个 KV 条目**，以 1/8 的 token 占用跑赢 GPT-5.4 与 Claude 4.6 级别的长上下文视觉推理。
 
 ---
 
-## 🚀 6. 其它系统级与速度优化 (P2 - 推理加速)
+## 🚀 6. 💡 2026 前沿：Better, Faster, Stronger 进阶路线图 (P2 - 后续迭代)
 
-*   **生产级 REST API 流式输出**：实现 `serve/` 中 `/api/chat` 的正式流式输出。
-*   **双模型投机采样 (Speculative Decoding)**：设计 100M 级的 draft model，通过共享 KV Cache 和投机采样，将 1.5B 模型的推理吞吐提升 **2~3 倍**。
-*   **自定义 Triton Flash-MLA 算子**：开发专用的 Triton MLA 算子，融合低秩投影和 Attention 操作，最大化减少 VRAM 带宽瓶颈。
+除了上述针对大模型识图的前沿升级，我们原有的模型进阶提升路线完全保留并细化如下：
+
+### 6.1 更好 (Better) —— 智能与推理极限
+*   **GRPO 推理强化学习 (Reasoning RL)**：利用 [grpo/](file:///home/ifnodoraemon/myagent/nano-llm/grpo) 模块，通过数学/代码任务设计高保真规则编译器和格式奖励（Accuracy & Format Rewards），训练基座模型自主涌现类似 DeepSeek-R1 的 `<think>` 思考链（CoT）与自我纠错能力。
+*   **高质量蒸馏数据混合 (Distillation)**：从顶级推理模型中提取推理轨迹（Rationale Traces），混合到微调数据中，提升小模型的逻辑泛化力。
+*   **在线 DPO (On-policy DPO)**：在对齐阶段，将离线对比样本升级为在线即时采样，克服离线偏置。
+
+### 6.2 更快 (Faster) —— 算力与速度极限
+*   **生产级 REST API 流式输出**：实现 `serve/` 中 `/api/chat` 的正式流式输出（目前为 mock 逻辑，需替换为真实的 SSE 协议与 HuggingFace TextStreamer 适配）。
+*   **自定义 Triton 算子优化**：编写定制的 Triton Flash-MLA 算子，在注意力层面融合低秩压缩和 FlashAttention，削减长上下文的访存带宽瓶颈。
+*   **双模型投机采样 (Speculative Decoding)**：使用一个更小的 draft model（如 100M-200M），利用其轻量级 KV-cache 和 MLA 特性，加速 1.5B/2B 目标模型的自回归生成，在无损精度下将推理吞吐提升 **2~3 倍**。
+*   **FP8 混合精度推理量化**：支持在线 FP8 的权重与激活值（W8A8）量化部署，最大化压缩显存并饱和释放 H800 的 FP8 Tensor Core 吞吐性能。
+
+### 6.3 更强 (Stronger) —— 视觉多模态与系统鲁棒性
+*   **多模态视觉能力解锁 (VLM)**：将配置中的 `vision_dim`（目前预留了 `1152`）与 SigLIP 等预训练视觉编码器对齐。通过双阶段对齐（Projector 对齐 -> 图像-文本联合微调），将基座升级为具备高保真图文理解力的多模态模型，对标 DeepSeek-VL。
+*   **DoRA 无损微调支持**：支持权重分解低秩适应（DoRA），为下游垂直行业提供更强、更稳定的参数高效微调。

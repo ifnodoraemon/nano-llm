@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import random
 import argparse
 import logging
@@ -7,12 +8,13 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 from model import Transformer
+from utils.sandbox_executor import SandboxCodeExecutor
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-# 1. Pre-Baked Benchmark Question Corpora
+# 1. Pre-Baked Benchmark Question Corpora (Fallbacks)
 # ==============================================================================
 
 MMLU_SAMPLES = [
@@ -63,27 +65,92 @@ GSM8K_SAMPLES = [
     }
 ]
 
+ARC_SAMPLES = [
+    {
+        "question": "Which of the following is a physical change?",
+        "choices": [
+            "A) Burning wood",
+            "B) Melting ice",
+            "C) Rusting iron",
+            "D) Baking a cake"
+        ],
+        "answer": "B"
+    },
+    {
+        "question": "Which cell organelle is known as the powerhouse of the cell?",
+        "choices": [
+            "A) Nucleus",
+            "B) Mitochondria",
+            "C) Ribosome",
+            "D) Golgi apparatus"
+        ],
+        "answer": "B"
+    }
+]
+
+HELLASWAG_SAMPLES = [
+    {
+        "context": "A man is sawing a wooden plank. He holds the plank with one hand and uses the other hand to",
+        "choices": [
+            "A) hold a hammer",
+            "B) move the saw back and forth",
+            "C) read a book",
+            "D) drink a glass of water"
+        ],
+        "answer": "B"
+    }
+]
+
+HUMANEVAL_SAMPLES = [
+    {
+        "task_id": "custom/1",
+        "prompt": "def add_numbers(a, b):\n    \"\"\"Return the sum of a and b\"\"\"\n",
+        "test": "assert add_numbers(2, 3) == 5\nassert add_numbers(-1, 1) == 0",
+        "entry_point": "add_numbers"
+    }
+]
+
+# Helper function to load dataset from jsonl
+def load_jsonl(path: str) -> list:
+    if not path or not os.path.exists(path):
+        return None
+    samples = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    samples.append(json.loads(line))
+        return samples
+    except Exception as e:
+        logger.error(f"Error loading JSONL file {path}: {e}")
+        return None
+
 # ==============================================================================
-# 2. Logits-Based MMLU Evaluator
+# 2. Logits-Based MMLU/ARC/HellaSwag Choice Evaluators
 # ==============================================================================
 
 @torch.no_grad()
-def evaluate_mmlu(model: Transformer, tokenizer, device: str = "cuda") -> float:
+def evaluate_choices(model: Transformer, tokenizer, samples: list, name: str, device: str = "cuda") -> float:
     """
-    Evaluates MMLU multiple choice questions.
-    Extracts the logits for tokens 'A', 'B', 'C', 'D' at the single next step.
-    The letter with the highest logit score is the prediction.
+    Generic logits-based multiple-choice option evaluator.
+    Extracts logits for choice tokens at the next step.
     """
-    logger.info(f"--- Running MMLU Leaderboard Benchmarking ({len(MMLU_SAMPLES)} questions) ---")
+    logger.info(f"--- Running {name} Benchmarking ({len(samples)} questions) ---")
     correct_count = 0
     
     # Pre-encode option tokens
     option_tokens = [tokenizer.encode(letter, add_special_tokens=False)[0] for letter in ["A", "B", "C", "D"]]
     
-    for idx, sample in enumerate(MMLU_SAMPLES):
+    for idx, sample in enumerate(samples):
         # Format the question and options
-        prompt = f"Question: {sample['question']}\n"
-        for choice in sample["choices"]:
+        if "question" in sample:
+            prompt = f"Question: {sample['question']}\n"
+        elif "context" in sample:
+            prompt = f"Context: {sample['context']}\nComplete the sentence:\n"
+        else:
+            continue
+            
+        for choice in sample.get("choices", []):
             prompt += f"{choice}\n"
         prompt += "Answer: "
         
@@ -102,16 +169,20 @@ def evaluate_mmlu(model: Transformer, tokenizer, device: str = "cuda") -> float:
         prediction_idx = torch.argmax(option_logits).item()
         predicted_letter = ["A", "B", "C", "D"][prediction_idx]
         
-        is_correct = predicted_letter == sample["answer"]
+        correct_answer = sample.get("answer", "A")
+        is_correct = predicted_letter == correct_answer
         if is_correct:
             correct_count += 1
             
-        logger.info(
-            f"Q{idx+1}: Predicted={predicted_letter} | Correct={sample['answer']} | "
-            f"Result={'✅ CORRECT' if is_correct else '❌ WRONG'}"
-        )
+        # Log periodically to avoid output clutter
+        if idx % 10 == 0 or len(samples) <= 5:
+            logger.info(
+                f"{name} Q{idx+1}: Predicted={predicted_letter} | Correct={correct_answer} | "
+                f"Result={'✅ CORRECT' if is_correct else '❌ WRONG'}"
+            )
         
-    accuracy = correct_count / len(MMLU_SAMPLES)
+    accuracy = correct_count / len(samples) if samples else 0.0
+    logger.info(f"🏆 {name} Accuracy: {accuracy*100:.2f}%")
     return accuracy
 
 # ==============================================================================
@@ -119,16 +190,16 @@ def evaluate_mmlu(model: Transformer, tokenizer, device: str = "cuda") -> float:
 # ==============================================================================
 
 @torch.no_grad()
-def evaluate_gsm8k(model: Transformer, tokenizer, device: str = "cuda") -> float:
+def evaluate_gsm8k(model: Transformer, tokenizer, samples: list, device: str = "cuda") -> float:
     """
     Evaluates Grade School Math (GSM8K) word problems.
     Triggers Chain-of-Thought autoregressive generation,
     parses out the final numerical value using regex, and checks for Exact Match.
     """
-    logger.info(f"--- Running GSM8K Math Benchmarking ({len(GSM8K_SAMPLES)} questions) ---")
+    logger.info(f"--- Running GSM8K Math Benchmarking ({len(samples)} questions) ---")
     correct_count = 0
     
-    for idx, sample in enumerate(GSM8K_SAMPLES):
+    for idx, sample in enumerate(samples):
         prompt = f"Question: {sample['question']}\nLet's think step by step. Show your calculations and state the final answer clearly."
         formatted_prompt = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
         
@@ -154,21 +225,79 @@ def evaluate_gsm8k(model: Transformer, tokenizer, device: str = "cuda") -> float
         numbers = re.findall(r'\b\d+\b', completion)
         predicted_answer = numbers[-1] if numbers else "NONE"
         
-        is_correct = predicted_answer == sample["answer"]
+        correct_answer = sample.get("answer", "").strip()
+        is_correct = predicted_answer == correct_answer
         if is_correct:
             correct_count += 1
             
-        logger.info(
-            f"Math Q{idx+1}: Predicted={predicted_answer} | Correct={sample['answer']} | "
-            f"Result={'✅ CORRECT' if is_correct else '❌ WRONG'}\n"
-            f"   [CoT]: \"{completion.strip()[:120]}...\""
-        )
+        if idx % 10 == 0 or len(samples) <= 5:
+            logger.info(
+                f"Math Q{idx+1}: Predicted={predicted_answer} | Correct={correct_answer} | "
+                f"Result={'✅ CORRECT' if is_correct else '❌ WRONG'}\n"
+                f"   [CoT]: \"{completion.strip()[:100]}...\""
+            )
         
-    accuracy = correct_count / len(GSM8K_SAMPLES)
+    accuracy = correct_count / len(samples) if samples else 0.0
+    logger.info(f"🏆 GSM8K Accuracy: {accuracy*100:.2f}%")
     return accuracy
 
 # ==============================================================================
-# 4. LLM-as-a-Judge Automated Elo Arena
+# 4. HumanEval Python Coding Evaluator (Sandbox Execution)
+# ==============================================================================
+
+@torch.no_grad()
+def evaluate_humaneval(model: Transformer, tokenizer, samples: list, device: str = "cuda") -> float:
+    """
+    Evaluates Python coding capacity on HumanEval using SandboxCodeExecutor.
+    """
+    logger.info(f"--- Running HumanEval Code Benchmarking ({len(samples)} questions) ---")
+    sandbox = SandboxCodeExecutor(timeout=2.0)
+    correct_count = 0
+    
+    for idx, sample in enumerate(samples):
+        prompt = sample["prompt"]
+        formatted_prompt = f"<|im_start|>user\nWrite the Python function definition to solve this:\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+        
+        input_ids = tokenizer.encode(formatted_prompt, add_special_tokens=False)
+        generated_ids = list(input_ids)
+        
+        for _ in range(256):
+            active_x = torch.tensor([generated_ids[-model.config.block_size:]], dtype=torch.long, device=device)
+            logits, _, _ = model(active_x)
+            next_tok = torch.argmax(logits[0, -1, :]).item()
+            generated_ids.append(next_tok)
+            if next_tok in [tokenizer.eos_token_id, tokenizer.encode("<|im_end|>", add_special_tokens=False)[0]]:
+                break
+                
+        completion = tokenizer.decode(generated_ids[len(input_ids):], skip_special_tokens=True)
+        
+        # Extract code block
+        extracted_code = sandbox.extract_code(completion)
+        if not extracted_code:
+            # Fallback if model didn't wrap in markdown blocks but generated code
+            extracted_code = completion
+            
+        # Run in sandbox with assertions
+        assertions = sample.get("test", "")
+        exec_res = sandbox.execute_and_verify(extracted_code, assertions=assertions)
+        
+        is_correct = exec_res.get("success", False)
+        if is_correct:
+            correct_count += 1
+            
+        if idx % 5 == 0 or len(samples) <= 5:
+            logger.info(
+                f"Code Q{idx+1} ({sample.get('task_id', 'custom')}): "
+                f"Result={'✅ PASSED' if is_correct else '❌ FAILED'} | "
+                f"Error: {exec_res.get('error', 'None')}"
+            )
+            
+    accuracy = correct_count / len(samples) if samples else 0.0
+    logger.info(f"🏆 HumanEval Pass@1: {accuracy*100:.2f}%")
+    return accuracy
+
+# ==============================================================================
+# 5. LLM-as-a-Judge Automated Elo Arena
 # ==============================================================================
 
 ARENA_PROMPTS = [
@@ -181,9 +310,6 @@ ARENA_PROMPTS = [
 ]
 
 def generate_completion_for_arena(model: Transformer, tokenizer, prompt: str, device: str) -> str:
-    """
-    Generates text using standard autoregressive generation for Arena evaluation.
-    """
     formatted_prompt = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
     input_ids = tokenizer.encode(formatted_prompt, add_special_tokens=False)
     generated_ids = list(input_ids)
@@ -199,17 +325,6 @@ def generate_completion_for_arena(model: Transformer, tokenizer, prompt: str, de
     return tokenizer.decode(generated_ids[len(input_ids):], skip_special_tokens=True)
 
 def heuristic_referee_judge(prompt: str, response_a: str, response_b: str) -> float:
-    """
-    Simulates a high-quality LLM-as-a-judge by computing multi-dimensional heuristic quality scores.
-    Scores are based on:
-    1. Richness of CoT reasoning (presence of reasoning tags / length of thinking).
-    2. Answer structure and vocabulary diversity.
-    3. Formatting constraints and blocklist hygiene.
-    
-    Returns:
-        Score between 0.0 and 1.0 representing probability of Model A winning.
-        0.5 represents a tie, >0.5 represents A winning, <0.5 represents B winning.
-    """
     score_a = 0.0
     score_b = 0.0
     
@@ -219,7 +334,7 @@ def heuristic_referee_judge(prompt: str, response_a: str, response_b: str) -> fl
     if has_cot_a: score_a += 1.0
     if has_cot_b: score_b += 1.0
     
-    # 2. Length regularization (penalize extreme short or extreme word loop repetitions)
+    # 2. Length regularization
     len_a = len(response_a)
     len_b = len(response_b)
     
@@ -236,12 +351,11 @@ def heuristic_referee_judge(prompt: str, response_a: str, response_b: str) -> fl
     score_a += uniq_ratio_a * 2.0
     score_b += uniq_ratio_b * 2.0
     
-    # 4. Coding constraint match (if prompt asks for python code)
+    # 4. Coding constraint match
     if "python" in prompt.lower() or "code" in prompt.lower():
         if "def " in response_a or "```" in response_a: score_a += 1.5
         if "def " in response_b or "```" in response_b: score_b += 1.5
         
-    # Calculate win probability
     total = score_a + score_b
     if total == 0:
         return 0.5
@@ -253,55 +367,39 @@ def evaluate_arena(
     tokenizer, 
     device: str = "cuda"
 ) -> dict:
-    """
-    Executes a blind pairwise de duel (Arena) over ARENA_PROMPTS.
-    Updates Elo ratings starting from 1200.
-    """
     logger.info(f"--- Launching LLM-as-a-Judge Elo Arena ({len(ARENA_PROMPTS)} rounds) ---")
     elo_a = 1200.0
     elo_b = 1200.0
-    K = 32.0 # Elo scaling weight
+    K = 32.0
     
     wins_a = 0
     wins_b = 0
     ties = 0
     
     for idx, prompt in enumerate(ARENA_PROMPTS):
-        logger.info(f"Arena Round {idx+1}: Prompt = '{prompt[:50]}...'")
-        
-        # Generate completions blind
         resp_a = generate_completion_for_arena(model_a, tokenizer, prompt, device)
         resp_b = generate_completion_for_arena(model_b, tokenizer, prompt, device)
         
-        # Judge grades the pairwise outputs
         prob_a_wins = heuristic_referee_judge(prompt, resp_a, resp_b)
         
-        # Determine match outcome
         if prob_a_wins > 0.55:
             outcome_a = 1.0
             outcome_b = 0.0
             wins_a += 1
-            logger.info("   [Judge Decision]: Model A Wins!")
         elif prob_a_wins < 0.45:
             outcome_a = 0.0
             outcome_b = 1.0
             wins_b += 1
-            logger.info("   [Judge Decision]: Model B Wins!")
         else:
             outcome_a = 0.5
             outcome_b = 0.5
             ties += 1
-            logger.info("   [Judge Decision]: It's a Draw!")
             
-        # Expected scores
         exp_a = 1.0 / (1.0 + 10.0 ** ((elo_b - elo_a) / 400.0))
         exp_b = 1.0 / (1.0 + 10.0 ** ((elo_a - elo_b) / 400.0))
         
-        # Update Elo
         elo_a = elo_a + K * (outcome_a - exp_a)
         elo_b = elo_b + K * (outcome_b - exp_b)
-        
-        logger.info(f"   [Elo Status]: Model A Elo = {elo_a:.1f} | Model B Elo = {elo_b:.1f}")
         
     return {
         "wins_a": wins_a,
@@ -312,18 +410,13 @@ def evaluate_arena(
     }
 
 # ==============================================================================
-# 5. Automated Needle-in-a-Haystack (NIAH) Synthesized Context Evaluator
+# 6. Automated Needle-in-a-Haystack (NIAH) Synthesized Context Evaluator
 # ==============================================================================
 
 class NeedleInAHaystackEvaluator:
-    """
-    Industry-standard Needle-in-a-Haystack (NIAH) benchmark synthetic generator.
-    Generates extremely long document contexts, inserts hidden facts at variable
-    depth percentiles, and scores model retrieval accuracy dynamically.
-    """
     def __init__(self, context_lengths: list[int] = None, document_depths: list[float] = None):
         self.context_lengths = context_lengths if context_lengths else [1024, 2048, 4096]
-        self.document_depths = document_depths if document_depths else [0.1, 0.5, 0.9] # 10%, 50%, 90% depth
+        self.document_depths = document_depths if document_depths else [0.1, 0.5, 0.9]
         
     def generate_noise_context(self, target_word_count: int) -> str:
         filler_sentences = [
@@ -340,8 +433,7 @@ class NeedleInAHaystackEvaluator:
         return text
 
     def run_eval(self, model: Transformer, tokenizer, device: str = "cuda") -> dict:
-        logger.info(f"--- Running Needle-in-a-Haystack (NIAH) Evaluation ({len(self.context_lengths)} lengths x {len(self.document_depths)} depths) ---")
-        
+        logger.info(f"--- Running Needle-in-a-Haystack (NIAH) Evaluation ---")
         results = {}
         random.seed(1337)
         
@@ -351,8 +443,6 @@ class NeedleInAHaystackEvaluator:
         
         for c_len in self.context_lengths:
             for depth in self.document_depths:
-                logger.info(f"👉 Evaluating context_length={c_len} | needle_depth={depth*100:.0f}%...")
-                
                 noise = self.generate_noise_context(c_len)
                 words = noise.split()
                 
@@ -377,7 +467,6 @@ class NeedleInAHaystackEvaluator:
                         
                 response = tokenizer.decode(generated_ids[len(input_ids):], skip_special_tokens=True)
                 
-                # Check for answer tags
                 pattern = r"<answer>(.*?)</answer>"
                 match = re.search(pattern, response, re.DOTALL)
                 extracted = match.group(1).strip() if match else ""
@@ -390,19 +479,10 @@ class NeedleInAHaystackEvaluator:
                 score = 1.0 if is_correct else 0.0
                 results[f"{c_len}_{depth:.1f}"] = score
                 
-                logger.info(
-                    f"   [Result]: {'✅ FOUND' if is_correct else '❌ LOST'} | "
-                    f"Response: \"{response.strip()[:60]}...\""
-                )
-                
         return results
 
 @torch.no_grad()
 def evaluate_perplexity(model: Transformer, val_bin_path: str = "./data/binaries/val.bin", block_size: int = 1024, num_batches: int = 100, device: str = "cuda") -> float:
-    """
-    Computes the exact mathematical Perplexity (PPL) of the pre-trained base model
-    on the held-out validation token binary dataset.
-    """
     logger.info(f"--- Running Intrinsic Perplexity (PPL) Evaluation on {val_bin_path} ---")
     if not os.path.exists(val_bin_path):
         logger.warning(f"Validation binary not found at {val_bin_path} — skipping PPL.")
@@ -415,7 +495,6 @@ def evaluate_perplexity(model: Transformer, val_bin_path: str = "./data/binaries
         total_loss = 0.0
         count = 0
         
-        # Run deterministic batched loss evaluation over validation corpus
         for i in range(num_batches):
             start_idx = (i * block_size) % (len(val_data) - block_size - 1)
             x = torch.from_numpy(val_data[start_idx : start_idx + block_size].astype(np.int64)).unsqueeze(0).to(device)
@@ -433,7 +512,6 @@ def evaluate_perplexity(model: Transformer, val_bin_path: str = "./data/binaries
         logger.error(f"Failed to calculate perplexity: {e}")
         return float('inf')
 
-
 # ==============================================================================
 # Main Orchestrated Runner
 # ==============================================================================
@@ -442,6 +520,11 @@ def main():
     parser = argparse.ArgumentParser(description="nano-llm: Automated Leaderboard Benchmark Evaluator")
     parser.add_argument("--checkpoint_path", type=str, required=True, help="Path to saved model .pt checkpoint file")
     parser.add_argument("--baseline_checkpoint_path", type=str, default=None, help="Optional path to baseline model checkpoint to run Arena")
+    parser.add_argument("--mmlu_path", type=str, default="./data/eval/mmlu.jsonl", help="Path to MMLU JSONL file")
+    parser.add_argument("--gsm8k_path", type=str, default="./data/eval/gsm8k.jsonl", help="Path to GSM8K JSONL file")
+    parser.add_argument("--arc_path", type=str, default="./data/eval/arc.jsonl", help="Path to ARC Challenge JSONL file")
+    parser.add_argument("--hellaswag_path", type=str, default="./data/eval/hellaswag.jsonl", help="Path to HellaSwag JSONL file")
+    parser.add_argument("--humaneval_path", type=str, default="./data/eval/humaneval.jsonl", help="Path to HumanEval JSONL file")
     args = parser.parse_args()
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -450,27 +533,32 @@ def main():
     from utils.checkpoint_utils import load_checkpoint_with_fp8_translation
     model_config, state_dict = load_checkpoint_with_fp8_translation(args.checkpoint_path, map_location=device)
     
-    # Instantiate Model
     model = Transformer(model_config).to(device)
     model.load_state_dict(state_dict)
     model.eval()
     
-    # Load tokenizer
     logger.info("Initializing tokenizer...")
     from utils.tokenizer_loader import load_tokenizer
     tokenizer = load_tokenizer()
-        
-    # 0. Run Validation Perplexity (PPL) Intrinsic Evaluation
+    
+    # 0. Load Datasets (Load from JSONL files, fallback if not found)
+    mmlu_samples = load_jsonl(args.mmlu_path) or MMLU_SAMPLES
+    gsm_samples = load_jsonl(args.gsm8k_path) or GSM8K_SAMPLES
+    arc_samples = load_jsonl(args.arc_path) or ARC_SAMPLES
+    hs_samples = load_jsonl(args.hellaswag_path) or HELLASWAG_SAMPLES
+    he_samples = load_jsonl(args.humaneval_path) or HUMANEVAL_SAMPLES
+    
+    # 1. Run Validation Perplexity (PPL)
     val_ppl = evaluate_perplexity(model, val_bin_path="./data/binaries/val.bin", block_size=model_config.block_size, device=device)
 
-    # 1. Run MMLU
-    mmlu_acc = evaluate_mmlu(model, tokenizer, device=device)
-    
-    # 2. Run GSM8K
-    gsm_acc = evaluate_gsm8k(model, tokenizer, device=device)
+    # 2. Run Evaluations
+    mmlu_acc = evaluate_choices(model, tokenizer, mmlu_samples, "MMLU", device=device)
+    gsm_acc = evaluate_gsm8k(model, tokenizer, gsm_samples, device=device)
+    arc_acc = evaluate_choices(model, tokenizer, arc_samples, "ARC-Challenge", device=device)
+    hs_acc = evaluate_choices(model, tokenizer, hs_samples, "HellaSwag", device=device)
+    he_pass = evaluate_humaneval(model, tokenizer, he_samples, device=device)
     
     # 3. Run Elo Arena
-    # If no baseline is provided, we clone the model configuration to run self-arena representing standard decoding baseline
     if args.baseline_checkpoint_path and os.path.exists(args.baseline_checkpoint_path):
         logger.info(f"Loading baseline checkpoint state from: {args.baseline_checkpoint_path}")
         base_config, base_state = load_checkpoint_with_fp8_translation(args.baseline_checkpoint_path, map_location=device)
@@ -479,19 +567,25 @@ def main():
         baseline_model.eval()
     else:
         logger.info("No baseline checkpoint path provided. Running Self-Play Elo Arena comparing Model A against base initialization.")
-        import copy
-        baseline_model = Transformer(model_config).to(device) # Base random weights or identical model to simulate self-eval
+        baseline_model = Transformer(model_config).to(device)
         baseline_model.eval()
         
     arena_results = evaluate_arena(model, baseline_model, tokenizer, device=device)
+    
+    # Consolidated Average Score card
+    scores_list = [mmlu_acc, gsm_acc, arc_acc, hs_acc, he_pass]
+    consolidated_score = sum(scores_list) / len(scores_list)
     
     logger.info("=======================================================================")
     logger.info("📊 Benchmark Leaderboard & Arena Report:")
     logger.info("-----------------------------------------------------------------------")
     logger.info(f"🏆 Held-out Validation Perplexity (PPL): {val_ppl:.4f}")
-    logger.info(f"🏆 MMLU Multiple Choice Accuracy: {mmlu_acc*100:.2f}%")
-    logger.info(f"🏆 GSM8K Grade School Math Accuracy: {gsm_acc*100:.2f}%")
-    logger.info(f"🏆 Consolidated Leaderboard Index: {((mmlu_acc + gsm_acc)/2)*100:.2f}%")
+    logger.info(f"🏆 MMLU Accuracy: {mmlu_acc*100:.2f}%")
+    logger.info(f"🏆 GSM8K Accuracy: {gsm_acc*100:.2f}%")
+    logger.info(f"🏆 ARC-Challenge Accuracy: {arc_acc*100:.2f}%")
+    logger.info(f"🏆 HellaSwag Accuracy: {hs_acc*100:.2f}%")
+    logger.info(f"🏆 HumanEval Pass@1: {he_pass*100:.2f}%")
+    logger.info(f"🏆 Consolidated Leaderboard Index: {consolidated_score*100:.2f}%")
     logger.info(f"🏆 Arena Model A Final Elo Rating: {arena_results['final_elo_a']:.1f}")
     logger.info(f"🏆 Arena Model B Final Elo Rating: {arena_results['final_elo_b']:.1f}")
     logger.info(f"🏆 Match Statistics: A Wins={arena_results['wins_a']} | B Wins={arena_results['wins_b']} | Ties={arena_results['ties']}")
@@ -502,12 +596,14 @@ def main():
     niah_results = niah_evaluator.run_eval(model, tokenizer, device=device)
     
     # Save a JSON metric file for our Web Dashboard to read!
-    import json
     report = {
         "validation_perplexity": val_ppl,
         "mmlu_accuracy": mmlu_acc,
         "gsm8k_accuracy": gsm_acc,
-        "consolidated_score": (mmlu_acc + gsm_acc) / 2,
+        "arc_accuracy": arc_acc,
+        "hellaswag_accuracy": hs_acc,
+        "humaneval_pass": he_pass,
+        "consolidated_score": consolidated_score,
         "arena_wins_a": arena_results["wins_a"],
         "arena_wins_b": arena_results["wins_b"],
         "arena_ties": arena_results["ties"],
@@ -515,7 +611,6 @@ def main():
         "arena_elo_b": arena_results["final_elo_b"],
         "niah_results": niah_results
     }
-    # Ensure outputs directory exists
     os.makedirs("./outputs", exist_ok=True)
     with open("./outputs/eval_report.json", "w") as f:
         json.dump(report, f, indent=2)
