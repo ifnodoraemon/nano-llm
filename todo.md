@@ -9,7 +9,7 @@
 ### 1.1 监控 1.5B 预训练收敛 (P0 - 正在运行)
 *   **任务 ID**：`task-2212` (目标 5000 步，当前进度 755+)。
 *   **状态**：已解决 NVML 锁问题，单步耗时稳定在 **4.2 秒**，Loss 在 5.5 左右，收敛正常。
-*   **待办**：持续跟进 Loss 收敛趋势与梯度稳定性，预计在 2026-06-01 23:50 完成。
+*   **待办**：持续跟进 Loss收敛趋势与梯度稳定性，预计在 2026-06-01 23:50 完成。
 
 ### 1.2 修复 MFU (Model FLOPs Utilization) 计算错误 (P1)
 *   **问题**：[pretrain.py](file:///home/ifnodoraemon/myagent/nano-llm/pretrain.py#L374) 在计算 `mfu_percentage` 时，直接将集群总 FLOPs/sec 除以了单卡 H800 的峰值性能 (`312e12`)，导致算出的 MFU 偏大 `ddp_world_size` (8)倍。
@@ -21,18 +21,27 @@
     *   每 500 步在验证集上采样 50 个 batches 计算平均 loss。
     *   在 DDP 模式下，通过 `dist.all_reduce` 跨卡聚合 val_loss，由 master 节点打印并上报至 `ExperimentTracker`。
 
-### 1.4 💡 预训练算法与数据级技术创新 (Pre-training Innovations) (P2)
-为了全面提升 1.5B 稠密基座模型的无监督压缩上限、抗遗忘能力和推理先验，我们规划了以下预训练创新：
-*   **1) 预训练退火阶段逻辑夹带 (Annealing CoT Injection)**：
-    *   *设计*：在预训练的 Cosine LR 余弦衰减（Decay）阶段，模型的参数可塑性极高。我们在最后 10% 的退火阶段混入 5% 的高质量合成长推理（CoT）轨迹数据与代码执行树数据。
-    *   *目的*：无需等待后训练，直接在预训练基座中前置注入逻辑思维链结构表征，提升 zero-shot 推理倾向。
-*   **2) 动态课程数据混合 (Curriculum Data Mixing)**：
-    *   *设计*：摒弃静态数据比例。前期以高比例的百科、代码语法等低熵高事实数据建立基础语法网络；中期逐步提升复杂代码、数理逻辑和长文档占比，强迫模型提取结构化关联；后期执行热力退火。
-*   **3) Token-Level Loss 差异化在线噪声过滤 (Loss-Based Filtering)**：
-    *   *设计*：在 DataLoader 批次分发中，对每一个 micro-batch 进行 loss 初探。如果当前 loss 极低（说明为极度重复的无效广告/协议模板）或 loss 异常高（说明是噪声/乱码），则动态收缩该 batch 的梯度更新权重，节省 15% 的无效算力。
-*   **4) 随机深度预训练 (Pre-training Stochastic Depth)**：
-    *   *设计*：在 1.5B 小模型的 32 层网络中引入随机层级丢弃（Stochastic Layer Dropout）。在训练过程中以特定概率 $p(l)$ 随机跳过部分 Transformer Block（通过残差直连），随着训练步数逐步降低丢弃率。
-    *   *目的*：强迫模型各层学习到更独立、解耦的特征，表现为网络集成（Ensemble）效应，大幅提升模型在后训练微调时的抗过拟合与抗灾难性遗忘能力。
+### 1.4 💡 预训练算法与数据级硬核技术创新 (Pre-training Deep Innovations)
+为了突破 1.5B 稠密基座模型的无监督压缩上限、抗遗忘能力和评测客观性，我们规划了以下四大前沿预训练创新：
+
+*   **1) GNS-Adaptive Batch Size Scheduling (基于梯度噪声强度的自适应 Batch Size 调度)**：
+    *   *设计*：在线实时估算当前梯度的 Gradient Noise Scale (GNS)：$\text{GNS} = \text{tr}(\Sigma) / \|g\|^2$（协方差与均值之比）。在训练初期，GNS 较小，使用较小的 Batch Size（如 `--grad_accum_steps 1`）节省算力并快速发散；随着训练步数深入和梯度收敛，GNS 增大，自动成倍调大梯度累积步数以扩大全局 Batch Size。
+    *   *目的*：从理论上将预训练收敛效率提升 1.5 ~ 2.0 倍，并在中后期有效抑止梯度发散。
+*   **2) Benchmark Leakage Prevention & Semantic Blocking (语义指纹阻断防泄露引擎)**：
+    *   *设计*：在 Dataloader 阶段集成一个语义指纹过滤器。将 MMLU、GSM8K、ARC 等评测基准的问题库在内存中构建为轻量级的局部敏感哈希（LSH）或 5-gram 索引。在载入预训练数据块时进行实时对比，一旦重合度触发阈值，直接对该块执行 semantic masking（将对应 labels 设为 -100），彻底阻断 benchmark 泄露。
+    *   *目的*：确保基座模型在下游 benchmark 上的评估成绩为纯粹的 Zero-Shot 泛化，而非数据记忆。
+*   **3) LG-Opt: Loss-Gradient Decoupled Rescaling (基于 Loss 偏导的梯度自适应重缩放)**：
+    *   *设计*：在反向传播前，根据当前 batch 的 loss 偏离 EMA (指数移动平均) 历史 loss 的绝对偏差 $\delta = |\text{Loss} - \text{EMA\_Loss}|$，动态计算动态重缩放因子：
+        *   若 $\delta > 3\sigma$（偏离过高，判定为二进制噪声或系统日志等脏数据），对该 Batch 的梯度乘 0.1 衰减权重，防止参数学坏；
+        *   若 Loss 接近于 0 且 $\delta \approx 0$（判定为版权免责声明等高度冗余数据），进行轻微惩罚。
+    *   *目的*：从算法底层提供预训练稳定性护栏，彻底摆脱对繁琐 Adam 超参数的经验调参依赖。
+*   **4) Spectral Decoupled RoPE Base Scaling (谱分离位置编码基频预外推)**：
+    *   *设计*：不同于 YaRN 等对称插值，在预训练阶段应用谱分离位置编码：
+        *   对高频维度部分（代表短程局部注意力）保持基频 $\theta=10000$ 绝对不缩放，确保 1K 范围内的近距离高精度逻辑和结构感知；
+        *   对中低频维度部分（代表长程语境）使用指数衰减因子进行插值外推。
+    *   *目的*：实现在 4K 的常规预训练中，让模型直接具备外推 16K+ 长上下文的能力，且短文本性能零退化。
+*   **5) Annealing CoT Injection (退火阶段逻辑夹带)**：
+    *   *设计*：在余弦学习率衰减至 Min_LR 的退火（Annealing）阶段，混入 5% 的高质量多步推理合成数据，从而在预训练中就激活强大的结构化推理表达。
 
 ---
 
