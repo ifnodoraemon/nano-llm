@@ -22,10 +22,8 @@
     *   在 DDP 模式下，通过 `dist.all_reduce` 跨卡聚合 val_loss，由 master 节点打印并上报至 `ExperimentTracker`。
 
 ### 1.4 💡 预训练算法与数据级硬核技术创新 (Pre-training Deep Innovations)
-为了突破 1.5B 稠密基座模型的无监督压缩上限、抗遗忘能力和评测客观性，我们规划了以下四大前沿预训练创新：
-
 *   **1) GNS-Adaptive Batch Size Scheduling (基于梯度噪声强度的自适应 Batch Size 调度)**：
-    *   *设计*：在线实时估算当前梯度的 Gradient Noise Scale (GNS)：$\text{GNS} = \text{tr}(\Sigma) / \|g\|^2$（协方差与均值之比）。在训练初期，GNS 较小，使用较小的 Batch Size（如 `--grad_accum_steps 1`）节省算力并快速发散；随着训练步数深入和梯度收敛，GNS 增大，自动成倍调大梯度累积步数以扩大全局 Batch Size。
+    *   *设计*：在线实时估算当前梯度的 Gradient Noise Scale (GNS)：$\text{GNS} = \text{tr}(\Sigma) / \|g\|^2$。在训练初期，GNS 较小，使用较小的 Batch Size（如 `--grad_accum_steps 1`）节省算力并快速发散；随着训练步数深入和梯度收敛，GNS 增大，自动成倍调大梯度累积步数以扩大全局 Batch Size。
     *   *目的*：从理论上将预训练收敛效率提升 1.5 ~ 2.0 倍，并在中后期有效抑止梯度发散。
 *   **2) Benchmark Leakage Prevention & Semantic Blocking (语义指纹阻断防泄露引擎)**：
     *   *设计*：在 Dataloader 阶段集成一个语义指纹过滤器。将 MMLU、GSM8K、ARC 等评测基准的问题库在内存中构建为轻量级的局部敏感哈希（LSH）或 5-gram 索引。在载入预训练数据块时进行实时对比，一旦重合度触发阈值，直接对该块执行 semantic masking（将对应 labels 设为 -100），彻底阻断 benchmark 泄露。
@@ -59,6 +57,12 @@
     *   修改脚本支持参数化长度测试（可配置为 `8192` 和 `16384`）。
     *   增加长文本 Perplexity (PPL) 递进测试，追踪模型在上下文拉长时，Attention 分布与交叉熵损失的演变情况。
 
+### 2.3 💡 工具调用与长任务轨迹级评估升级 (Agent & Tool-Use Evaluation) (P2)
+*   **问题**：当前评估系统仅评估最终答案（Outcome-based），缺乏对工具调用（Tool Use）和多步长任务规划能力的诊断，无法评估模型在遇到 API 报错等真实噪声时的容错自愈能力。
+*   **待办**：
+    *   **Trace-Level Action Match (轨迹级动作匹配评测)**：实现工具调用轨迹对比引擎，不仅评估最终输出，还要比对中间生成的 Tool Name、JSON 参数的准确度（F1-Score），精确评估中间规划是否有偏离或幻觉参数。
+    *   **Interactive Sandbox Environment (交互式沙盒与报错注入测试)**：构建沙盒交互测试集（模拟 API 查询），在评估时随机注入 API 报错噪声（如 `Rate Limit` 或 `Invalid Date`），检测模型在长程任务中是否能够感知错误并执行 Self-Correction 自我修复，最终达成全局目标。
+
 ---
 
 ## 🔧 3. SFT / DPO / GRPO 流程诊断与优化 (Fine-tuning & Alignment Gaps)
@@ -82,6 +86,12 @@
 *   **待办**：
     *   重构优势度归一化代码，去除不必要的双重归一化；在 DDP 模式下，支持跨卡搜集 rewards (`dist.all_gather`) 计算全局 Group Advantage。
     *   增加在线 Evaluation 阶段：每 50 步使用 20 个独立验证 prompt，评估平均生成长度、正确率、及 Sandbox 编译率，提供安全防崩塌护栏。
+
+### 3.4 💡 代理型对齐：步进奖励与约束规划 GRPO (Agentic GRPO & Constrained Alignment) (P2)
+*   **问题**：在工具调用和长程任务中，单纯依靠最终结果打分存在严重的“奖励稀疏（Sparse Reward）”问题；同时模型缺乏“预算/限制”意识，容易在多步调用中产生死循环。
+*   **待办**：
+    *   **Process-Supervised Step Reward (PRM 步进奖励)**：对 GRPO 训练引入多步过程监督。对于生成中途的每一个 `tool_call` 执行正则与结构化参数检验，对格式正确且逻辑连续的动作实时给予小额正向步进奖励（Step Reward $\gamma^t R_{step}$），加速复杂长任务的收敛。
+    *   **Budget-Constrained Penalty (预算约束惩罚机制)**：在 Prompt 中混入显式的全局约束条件（如：“限定 5 步交互” 或 “费用预算限制”），一旦模型在 GRPO 的采样轨迹中出现调用超频、死循环或超预算，给予惩罚性负奖励（如 $-3.0$），强迫模型学会“剪枝规划”与“最小代价求解”。
 
 ---
 
