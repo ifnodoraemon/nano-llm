@@ -153,13 +153,19 @@
     *   **Attention Logits Softcapping (软截断)**：在 Softmax 之前引入 tanh 运算，将 Scores 限制在 `[-cap, +cap]` 区间：
         $$\text{Scores} = \text{cap} \cdot \tanh\left(\frac{Q K^T}{\sqrt{d} \cdot \text{cap}}\right)$$
         稳定注意力权重，防止梯度爆炸。
-    *   **FP8 Safeguard Auto-Scaler (动态校准器)**：在训练期间每 100 步对权重和激活分布进行动态统计，更新 FP8 的 Scale Factor，保障低比特运算精度。
+    *   **FP8 Safeguard Auto-Scaler (动态校准器)**：在训练期间每 100 步对权重 and 激活分布进行动态统计，更新 FP8 的 Scale Factor，保障低比特运算精度。
 
 ### 5.5 💡 对标 Qwen3-VL：DeepStack 多层级特征级联融合与非因果图像掩码 (P2)
 *   **问题（老技术淘汰）**：传统的 LLaVA 式 VLM 仅在 Input 层进行单次视觉 token 拼接拼接（Input-only project），导致深层网络的多模态融合浮于表面；且对图像 token 盲目使用因果自回归注意力限制了像素表征效率。
 *   **设计**：
     *   **DeepStack Integration (深度层叠级联融合)**：废弃单纯的 Input 拼接投影。在前段多层（如第 2, 4, 6 层）设置级联层，将 Vision Transformer (ViT) 不同层级的隐层特征跨层直接融合注入，加深低阶特征与文字的强绑定。
     *   **Non-Causal Image Masking (非因果图像自注意力掩码)**：在 LLM 的 Attention 矩阵中，允许图像 tokens 之间进行无方向的双向注意力交互（Non-Causal），仅对文本部分应用 Causal Mask，极大释放图像空间物理定位理解精度。
+
+### 5.6 💡 对标 DeepSeek-VL2：Dynamic Tiling 动态图块切片与 Global-Local 混合注意力 (P2)
+*   **问题**：传统多模态直接等比缩放图像，会导致极端宽高比图像（如长条图表、高分辨率 PDF 文档）在拉伸时严重失真，同时完全丢失高分辨率底图的细粒度文字细节。
+*   **设计**：
+    *   **Dynamic Tiling Strategy (动态图块切片)**：输入图像首先进行等比缩放。对于高分辨率大图，自适应切割为多个 $384 \times 384$ 的局部 Tiles，同时生成一张全局 Thumbnail 缩略图 Tile，共同输入同一 Vision Encoder，以保留全局上下文和局部的极细微细节。
+    *   **Global-Local Hybrid Attention (全局-局部混合注意力)**：将局部的 tiles 语义向量和全局缩略图向量以并联形式映射为 visual tokens，在 LLM 侧建立针对不同 tiles 区域的空间路由机制，实现对长 PDF 和复杂图表的无损精确 OCR 与语义问答。
 
 ---
 
