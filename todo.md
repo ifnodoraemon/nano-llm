@@ -46,7 +46,7 @@
 ## 📊 2. 评估系统升级 (Comprehensive Evaluation System Gaps)
 
 ### 2.1 引入真实评测集代替 Mock 数据 (P1)
-*   **问题**：[eval_benchmarks.py](file:///home/ifnodoraemon/myagent/nano-llm/eval_benchmarks.py#L18) 中的 MMLU (3 题)、GSM8K (3 题) 和 Arena (6 题) 全是硬编码 Mock 数据，属于“伪评估”，无法客观反映模型的真实智能水平。
+*   **问题**：[eval_benchmarks.py](file:///home/ifnodoraemon/myagent/nano-llm/eval_benchmarks.py#L18) 中的 MMLU (3 题)、GSM8K (3 题) 和 Arena (6 题) 全是硬编码 Mock数据，属于“伪评估”，无法客观反映模型的真实智能水平。
 *   **待办**：
     *   从本地加载或自动下载一个更具代表性的小型真实评估数据集（如 100 题 bilingual MMLU, 50 题 GSM8K）。
     *   支持 `eval_benchmarks.py` 动态加载本地 JSON/JSONL 评估文件，避免硬编码样本。
@@ -92,6 +92,17 @@
 *   **待办**：
     *   **Process-Supervised Step Reward (PRM 步进奖励)**：对 GRPO 训练引入多步过程监督。对于生成中途的每一个 `tool_call` 执行正则与结构化参数检验，对格式正确且逻辑连续的动作实时给予小额正向步进奖励（Step Reward $\gamma^t R_{step}$），加速复杂长任务的收敛。
     *   **Budget-Constrained Penalty (预算约束惩罚机制)**：在 Prompt 中混入显式的全局约束条件（如：“限定 5 步交互” 或 “费用预算限制”），一旦模型在 GRPO 的采样轨迹中出现调用超频、死循环或超预算，给予惩罚性负奖励（如 $-3.0$），强迫模型学会“剪枝规划”与“最小代价求解”。
+
+### 3.5 💥 消除数据打包注意力交叉污染 (Solve Sequence Packing Mask Leakage) (P1)
+*   **问题**：[data.py](file:///home/ifnodoraemon/myagent/nano-llm/data.py#L93) 的 `SequencePackingCollator` 中将多个独立会话打包进同一个长度为 `max_length` 的 sequence。但在 [model/__init__.py](file:///home/ifnodoraemon/myagent/nano-llm/model/__init__.py#L393) 的 forward 循环中，调用 `layer` 时将 `mask` 强制写死为了 `None`，导致注意力退化为全局的下三角 Causal Mask。这意味着 packed sequence 中的后一会话在计算自注意力时，能完全看到前一会话的上下文，产生严重的跨样本注意力交叉泄露（Attention Cross-talk）与逻辑污染。
+*   **待办**：
+    *   重构 `SequencePackingCollator` 输出会话的 `cumulative_seqlens` 边界信息。
+    *   在 `train.py` 中构造 **Block-Diagonal Causal Attention Mask (块对角线因果掩码)**，对于不同会话之间的 token 交叉将注意力置为 $-\infty$。
+    *   修改 [model/__init__.py](file:///home/ifnodoraemon/myagent/nano-llm/model/__init__.py)，使 `Transformer.forward` 接受外接 `mask` 参数并透传至各层注意力机制。
+
+### 3.6 补齐多模态 (VLM) 视觉对齐全链路训练入口 (Unlock Multimodal Alignment Entry) (P2)
+*   **问题**：虽然 `data.py` 实现了 `MultimodalSFTDataset`，且模型底座包含了 `vision_projection`。但在 SFT、DPO 和 GRPO 的训练脚本中完全缺失多模态数据的调用开关，导致模型无法实际参与视觉对齐训练。
+*   **待办**：在 `train.py` / `align.py` 等脚本中补齐 `--use_multimodal` 开关，动态替换为多模态 Dataset 与 Collator，并将提取的 `pixel_values` 传入模型 forward 接口。
 
 ---
 
