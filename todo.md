@@ -12,7 +12,7 @@
 *   **待办**：持续跟进 Loss 收敛趋势与梯度稳定性，预计在 2026-06-01 23:50 完成。
 
 ### 1.2 修复 MFU (Model FLOPs Utilization) 计算错误 (P1)
-*   **问题**：[pretrain.py](file:///home/ifnodoraemon/myagent/nano-llm/pretrain.py#L374) 在计算 `mfu_percentage` 时，直接将集群总 FLOPs/sec 除以了单卡 H800 的峰值性能 (`312e12`)，导致算出的 MFU 偏大 `ddp_world_size` (8) 倍。
+*   **问题**：[pretrain.py](file:///home/ifnodoraemon/myagent/nano-llm/pretrain.py#L374) 在计算 `mfu_percentage` 时，直接将集群总 FLOPs/sec 除以了单卡 H800 的峰值性能 (`312e12`)，导致算出的 MFU 偏大 `ddp_world_size` (8)倍。
 *   **待办**：修改 MFU 计算公式，将分母更新为 `312e12 * ddp_world_size`（或直接使用 `calculate_mfu` 助手函数），保证在 DDP 多卡模式下精确报告单卡算力利用率（预计真实 MFU 约为 ~52.7%）。
 
 ### 1.3 引入预训练周期性验证机制 (P1)
@@ -78,19 +78,43 @@
 
 ---
 
-## 💡 5. 进阶特性研发计划 (P2 - 后续迭代)
+## 💡 5. 业界领先模型对标与技术创新计划 (P2 - 后续迭代)
 
-### 5.1 更好 (Better) —— 智能与推理极限
-*   **GRPO 推理强化学习 (Reasoning RL)**：利用 [grpo/](file:///home/ifnodoraemon/myagent/nano-llm/grpo) 模块，通过数学/代码任务设计高保真规则编译器和格式奖励（Accuracy & Format Rewards），训练 1.5B 模型自主涌现类似 DeepSeek-R1 的 `<think>` 思考链（CoT）与自我纠错能力。
-*   **高质量蒸馏数据混合 (Distillation)**：从顶级推理模型中提取推理轨迹，混合到微调数据中，提升小模型的逻辑泛化力。
-*   **在线 DPO (On-policy DPO)**：在对齐阶段，将离线对比样本升级为在线即时采样，克服离线偏置。
+为了在 1.5B 稠密模型级别上超越 Qwen2.5、MiniCPM 和 DeepSeek-R1-Distill 等顶尖模型，我们规划了以下四大技术创新改造路线：
 
-### 5.2 更快 (Faster) —— 算力与速度极限
-*   **生产级 REST API 流式输出**：实现 `serve/` 中 `/api/chat` 的正式流式输出（目前为 mock 逻辑）。
-*   **自定义 Triton 算子优化**：编写定制的 Triton Flash-MLA 算子，在注意力层面融合低秩压缩和 FlashAttention，削减长上下文的访存带宽瓶颈。
-*   **双模型投机采样 (Speculative Decoding)**：使用一个更小的 draft model（如 100M-200M），利用其轻量级 KV-cache 和 MLA 特性，加速 1.5B 目标模型的自回归生成，在无损精度下将推理吞吐提升 **2~3 倍**。
-*   **FP8 混合精度推理量化**：支持在线 FP8 的权重与激活值（W8A8）量化部署，最大化压缩显存并饱和释放 H800 的 FP8 Tensor Core 吞吐性能。
+### 5.1 创新方向一：Debated-GRPO (辩论与对抗纠错强化学习)
+*   **痛点**：1.5B 小模型的逻辑熵较高，在强化学习中易陷入“逻辑死循环”或出现 Reward Hacking。
+*   **设计**：
+    *   **Peer-Review GRPO (对等评审机制)**：将采样得到的 $G$ 个 completions 划分为“生成器”与“评审员”。评审员接受生成器输出，在其内部的 `<think>` 中纠正逻辑漏洞，以纠错后的最终表现作为 Reward。
+    *   **Mutual Information Reward (互信息约束)**：引入多样性与熵奖励，惩罚在 `<think>` block 内大量堆砌符号、空格和行循环的行为。
+    *   **Cold-Start Reasoner CoT SFT (冷启动前置引导)**：在 GRPO 前混入约 1k 条带推理轨迹的高质量数学与代码 SFT 样本，引导小模型快速收敛。
 
-### 5.3 更强 (Stronger) —— 视觉多模态与系统鲁棒性
-*   **多模态视觉能力解锁 (VLM)**：将配置中的 `vision_dim`（目前预留了 `1152`）与 SigLIP 等预训练视觉编码器对齐。通过双阶段对齐（Projector 对齐 -> 图像-文本联合微调），将基座升级为具备高保真图文理解力的多模态模型，对标 DeepSeek-VL。
-*   **DoRA 无损微调支持**：支持权重分解低秩适应（DoRA），为下游垂直行业提供更强、更稳定的参数高效微调。
+### 5.2 创新方向二：Hybrid Sparse-MLA (混合稀疏-低秩注意力)
+*   **痛点**：在极长上下文 (16K+) 场景下，传统的全局 MLA 虽然减少了 KV Cache，但 $O(S^2)$ 的 Softmax 计算仍会导致显存与计算瓶颈。
+*   **设计**：
+    *   **Sliding Window MLA (滑动窗口低秩注意力)**：在 Transformer 的前半部分（低层与中层）使用局部滑动窗口注意力（如 window_size=2048），使计算和 KV 缓存复杂度降为 $O(S)$。
+    *   **Global MLA**：仅在 Transformer 的后半部分（高层）保留全局 MLA，用以捕获跨序列的长程检索特征，在保持“大海捞针”精确度的同时减少 60% 算力开销。
+
+### 5.3 创新方向三：Spatial-RoPE & Pixel-Shuffle (视觉多模态压缩与定位)
+*   **痛点**：视觉 token 数量巨大，易耗尽 1.5B 模型的上下文空间；同时 1D RoPE 会破坏视觉图像的 2D 物理空间连续性。
+*   **设计**：
+    *   **Pixel-Shuffle Downsampler (像素洗牌下采样器)**：用逆向 Pixel-Shuffle 算子对视觉 tokens 进行 $2 \times 2$ 空间拼入通道，将 token 数量从 1024 降为 256，节省 75% 序列长度。
+    *   **2D Decoupled RoPE (2D 分解 RoPE)**：在视觉 Transformer 和 LLM 的多模态前几层应用 2D 旋转位置编码，将维度对半应用 $X$ 和 $Y$ 轴旋转：
+        $$\mathbf{R}_{2D}(x, y) = \mathbf{R}_{1D}(x) \oplus \mathbf{R}_{1D}(y)$$
+        保留图像的高清空间位置敏感度。
+
+### 5.4 创新方向四：Logits Softcapping 与 FP8 精度护栏 (FP8 Safeguard)
+*   **痛点**：极长序列下注意力 Logits 易发散溢出；FP8 混合精度训练中容易因低精度表示带来下溢和下溢问题。
+*   **设计**：
+    *   **Attention Logits Softcapping (软截断)**：在 Softmax 之前引入 tanh 运算，将 Scores 限制在 `[-cap, +cap]` 区间：
+        $$\text{Scores} = \text{cap} \cdot \tanh\left(\frac{Q K^T}{\sqrt{d} \cdot \text{cap}}\right)$$
+        稳定注意力权重，防止梯度爆炸。
+    *   **FP8 Safeguard Auto-Scaler (动态校准器)**：在训练期间每 100 步对权重和激活分布进行动态统计，更新 FP8 的 Scale Factor，保障低比特运算精度。
+
+---
+
+## 🚀 6. 其它系统级与速度优化 (P2 - 推理加速)
+
+*   **生产级 REST API 流式输出**：实现 `serve/` 中 `/api/chat` 的正式流式输出。
+*   **双模型投机采样 (Speculative Decoding)**：设计 100M 级的 draft model，通过共享 KV Cache 和投机采样，将 1.5B 模型的推理吞吐提升 **2~3 倍**。
+*   **自定义 Triton Flash-MLA 算子**：开发专用的 Triton MLA 算子，融合低秩投影和 Attention 操作，最大化减少 VRAM 带宽瓶颈。
