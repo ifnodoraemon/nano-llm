@@ -4,7 +4,7 @@
 
 ---
 
-## 🎯 1. 预训练阶段 (Pre-training Gaps & Monitoring)
+## 🎯 1. 预训练阶段 (Pre-training Gaps & Innovations)
 
 ### 1.1 监控 1.5B 预训练收敛 (P0 - 正在运行)
 *   **任务 ID**：`task-2212` (目标 5000 步，当前进度 755+)。
@@ -20,6 +20,19 @@
 *   **待办**：在 [pretrain.py](file:///home/ifnodoraemon/myagent/nano-llm/pretrain.py) 中实现 `evaluate_val_loss`：
     *   每 500 步在验证集上采样 50 个 batches 计算平均 loss。
     *   在 DDP 模式下，通过 `dist.all_reduce` 跨卡聚合 val_loss，由 master 节点打印并上报至 `ExperimentTracker`。
+
+### 1.4 💡 预训练算法与数据级技术创新 (Pre-training Innovations) (P2)
+为了全面提升 1.5B 稠密基座模型的无监督压缩上限、抗遗忘能力和推理先验，我们规划了以下预训练创新：
+*   **1) 预训练退火阶段逻辑夹带 (Annealing CoT Injection)**：
+    *   *设计*：在预训练的 Cosine LR 余弦衰减（Decay）阶段，模型的参数可塑性极高。我们在最后 10% 的退火阶段混入 5% 的高质量合成长推理（CoT）轨迹数据与代码执行树数据。
+    *   *目的*：无需等待后训练，直接在预训练基座中前置注入逻辑思维链结构表征，提升 zero-shot 推理倾向。
+*   **2) 动态课程数据混合 (Curriculum Data Mixing)**：
+    *   *设计*：摒弃静态数据比例。前期以高比例的百科、代码语法等低熵高事实数据建立基础语法网络；中期逐步提升复杂代码、数理逻辑和长文档占比，强迫模型提取结构化关联；后期执行热力退火。
+*   **3) Token-Level Loss 差异化在线噪声过滤 (Loss-Based Filtering)**：
+    *   *设计*：在 DataLoader 批次分发中，对每一个 micro-batch 进行 loss 初探。如果当前 loss 极低（说明为极度重复的无效广告/协议模板）或 loss 异常高（说明是噪声/乱码），则动态收缩该 batch 的梯度更新权重，节省 15% 的无效算力。
+*   **4) 随机深度预训练 (Pre-training Stochastic Depth)**：
+    *   *设计*：在 1.5B 小模型的 32 层网络中引入随机层级丢弃（Stochastic Layer Dropout）。在训练过程中以特定概率 $p(l)$ 随机跳过部分 Transformer Block（通过残差直连），随着训练步数逐步降低丢弃率。
+    *   *目的*：强迫模型各层学习到更独立、解耦的特征，表现为网络集成（Ensemble）效应，大幅提升模型在后训练微调时的抗过拟合与抗灾难性遗忘能力。
 
 ---
 
@@ -78,25 +91,22 @@
 
 ---
 
-## 💡 5. 业界领先模型对标与技术创新计划 (P2 - 后续迭代)
+## 💡 5. 业界领先模型对标与后训练技术创新计划 (P2 - 后续迭代)
 
-为了在 1.5B 稠密模型级别上超越 Qwen2.5、MiniCPM 和 DeepSeek-R1-Distill 等顶尖模型，我们规划了以下四大技术创新改造路线：
+为了在 1.5B 稠密模型级别上超越 Qwen2.5、MiniCPM 和 DeepSeek-R1-Distill 等顶尖模型，我们规划了以下四大后训练技术创新改造路线：
 
 ### 5.1 创新方向一：Debated-GRPO (辩论与对抗纠错强化学习)
-*   **痛点**：1.5B 小模型的逻辑熵较高，在强化学习中易陷入“逻辑死循环”或出现 Reward Hacking。
 *   **设计**：
     *   **Peer-Review GRPO (对等评审机制)**：将采样得到的 $G$ 个 completions 划分为“生成器”与“评审员”。评审员接受生成器输出，在其内部的 `<think>` 中纠正逻辑漏洞，以纠错后的最终表现作为 Reward。
     *   **Mutual Information Reward (互信息约束)**：引入多样性与熵奖励，惩罚在 `<think>` block 内大量堆砌符号、空格和行循环的行为。
     *   **Cold-Start Reasoner CoT SFT (冷启动前置引导)**：在 GRPO 前混入约 1k 条带推理轨迹的高质量数学与代码 SFT 样本，引导小模型快速收敛。
 
 ### 5.2 创新方向二：Hybrid Sparse-MLA (混合稀疏-低秩注意力)
-*   **痛点**：在极长上下文 (16K+) 场景下，传统的全局 MLA 虽然减少了 KV Cache，但 $O(S^2)$ 的 Softmax 计算仍会导致显存与计算瓶颈。
 *   **设计**：
     *   **Sliding Window MLA (滑动窗口低秩注意力)**：在 Transformer 的前半部分（低层与中层）使用局部滑动窗口注意力（如 window_size=2048），使计算和 KV 缓存复杂度降为 $O(S)$。
     *   **Global MLA**：仅在 Transformer 的后半部分（高层）保留全局 MLA，用以捕获跨序列的长程检索特征，在保持“大海捞针”精确度的同时减少 60% 算力开销。
 
 ### 5.3 创新方向三：Spatial-RoPE & Pixel-Shuffle (视觉多模态压缩与定位)
-*   **痛点**：视觉 token 数量巨大，易耗尽 1.5B 模型的上下文空间；同时 1D RoPE 会破坏视觉图像的 2D 物理空间连续性。
 *   **设计**：
     *   **Pixel-Shuffle Downsampler (像素洗牌下采样器)**：用逆向 Pixel-Shuffle 算子对视觉 tokens 进行 $2 \times 2$ 空间拼入通道，将 token 数量从 1024 降为 256，节省 75% 序列长度。
     *   **2D Decoupled RoPE (2D 分解 RoPE)**：在视觉 Transformer 和 LLM 的多模态前几层应用 2D 旋转位置编码，将维度对半应用 $X$ 和 $Y$ 轴旋转：
@@ -104,7 +114,6 @@
         保留图像的高清空间位置敏感度。
 
 ### 5.4 创新方向四：Logits Softcapping 与 FP8 精度护栏 (FP8 Safeguard)
-*   **痛点**：极长序列下注意力 Logits 易发散溢出；FP8 混合精度训练中容易因低精度表示带来下溢和下溢问题。
 *   **设计**：
     *   **Attention Logits Softcapping (软截断)**：在 Softmax 之前引入 tanh 运算，将 Scores 限制在 `[-cap, +cap]` 区间：
         $$\text{Scores} = \text{cap} \cdot \tanh\left(\frac{Q K^T}{\sqrt{d} \cdot \text{cap}}\right)$$
