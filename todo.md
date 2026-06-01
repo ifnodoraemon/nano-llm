@@ -37,7 +37,13 @@
     *   *目的*：**在相同的训练 Token 数量下，提升预训练收敛速度 2.5 ~ 3.0 倍**，大幅压缩算力开销。
 *   **Manifold-Constrained Hyper-Connections (mHC, 流形约束超连接)**：
     *   *设计*：废弃传统的简单残差直连（Residual Connection），对多模态前向激活值引入流形约束映射。
-    *   *目的*：在处理极长上下文（8K/16K）和大规模跨模态注入时，彻底稳定神经信号传播，防范深层表征退化。
+    *   **目的**：在处理极长上下文（8K/16K）和大规模跨模态注入时，彻底稳定神经信号传播，防范深层表征退化。
+
+### 1.7 生产级预训练语料与后训练数据集就绪 (P0 - ✅ 进行中)
+*   **问题**：原先的训练数据集仅适合开发验证（预训练二进制仅 15M tokens）。为了对标生产级智能体模型，我们必须将数据集规模扩大至生产级别。
+*   **完成度**：
+    *   编写了 [data/download_pretrain_corpus.py](file:///home/ifnodoraemon/myagent/nano-llm/data/download_pretrain_corpus.py) (用于流式下载百G级 FineWeb-Edu 和 SkyPile-150B 预训练文本) 以及 [data/download_ultra_alignment_data.py](file:///home/ifnodoraemon/myagent/nano-llm/data/download_ultra_alignment_data.py) (用于下载 OpenHermes-2.5, CodeAlpaca, UltraFeedback Binarized, MATH, MBPP)。
+    *   在远程 GPU 服务器上正式启动了统一的数据集下载与 BPE Token 预打包流水线，正在将下载的优质文本直接打包为 `train.bin` 与 `val.bin`，并保存超万条 SFT/DPO/GRPO 优质样本。
 
 ---
 
