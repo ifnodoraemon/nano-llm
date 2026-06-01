@@ -1,6 +1,6 @@
 # nano-llm 项目全流程待办事项 (ToDo & Gaps Roadmap)
 
-目标：打通预训练、微调(SFT)、对齐(DPO)以及强化学习(GRPO)全链路，打磨极速、高性能、多模态的顶级 1.5B 稠密基座模型。
+目标：打通预训练、微调(SFT)、对齐(DPO)以及强化学习(GRPO)全链路，打磨极速、高性能、多模态的顶级 2B 稠密基座模型。
 
 ---
 
@@ -40,6 +40,11 @@
     *   *目的*：实现在 4K 的常规预训练中，让模型直接具备外推 16K+ 长上下文的能力，且短文本性能零退化。
 *   **5) Annealing CoT Injection (退火阶段逻辑夹带)**：
     *   *设计*：在余弦学习率衰减至 Min_LR 的退火（Annealing）阶段，混入 5% 的高质量多步推理合成数据，从而在预训练中就激活强大的结构化推理表达。
+
+### 1.5 💡 对标 Qwen3-VL：预训练 Interleaved-MRoPE 架构集成 (P2)
+*   **问题（老技术淘汰）**：传统多模态位置编码MRoPE虽然有时间（T）、高度（H）和宽度（W）的分立，但是分块进行的，容易造成视频长文本中的时空分辨率退化。
+*   **待办**：在预训练底层实现 **Interleaved-MRoPE (交错式多模态旋转位置编码)**：
+    *   将时空维度的旋转角度（$\theta_t, \theta_h, \theta_w$）在通道维度上进行交错式分布，确保每个注意力头的高低频频段同时感知 3D 关联，为后期直接具备原生 256K 超长视频理解打下物理位置表征底座。
 
 ---
 
@@ -94,7 +99,7 @@
     *   **Budget-Constrained Penalty (预算约束惩罚机制)**：在 Prompt 中混入显式的全局约束条件（如：“限定 5 步交互” 或 “费用预算限制”），一旦模型在 GRPO 的采样轨迹中出现调用超频、死循环或超预算，给予惩罚性负奖励（如 $-3.0$），强迫模型学会“剪枝规划”与“最小代价求解”。
 
 ### 3.5 💥 消除数据打包注意力交叉污染 (Solve Sequence Packing Mask Leakage) (P1)
-*   **问题**：[data.py](file:///home/ifnodoraemon/myagent/nano-llm/data.py#L93) 的 `SequencePackingCollator` 中将多个独立会话打包进同一个长度为 `max_length` 的 sequence。但在 [model/__init__.py](file:///home/ifnodoraemon/myagent/nano-llm/model/__init__.py#L393) 的 forward 循环中，调用 `layer` 时将 `mask` 强制写死为了 `None`，导致注意力退化为全局的下三角 Causal Mask。这意味着 packed sequence 中的后一会话在计算自注意力时，能完全看到前一会话的上下文，产生严重的跨样本注意力交叉泄露（Attention Cross-talk）与逻辑污染。
+*   **问题**：[data.py](file:///home/ifnodoraemon/myagent/nano-llm/data.py#L93) 的 `SequencePackingCollator` 中将多个独立会话打包进同一个长度为 `max_length` 的 sequence。但在 [model/__init__.py](file:///home/ifnodoraemon/myagent/nano-llm/model/__init__.py#L393) 的 forward 循环中，调用 `layer` 时将 `mask` 强制写死为了 `None`，导致注意力退化为全局的下三角 Causal Mask。这导致 packed sequence 中的后一会话在计算自注意力时，能完全看到前一会话的上下文，产生严重的跨样本注意力交叉泄露（Attention Cross-talk）与逻辑污染。
 *   **待办**：
     *   重构 `SequencePackingCollator` 输出会话的 `cumulative_seqlens` 边界信息。
     *   在 `train.py` 中构造 **Block-Diagonal Causal Attention Mask (块对角线因果掩码)**，对于不同会话之间的 token 交叉将注意力置为 $-\infty$。
@@ -123,7 +128,7 @@
 
 ## 💡 5. 业界领先模型对标与后训练技术创新计划 (P2 - 后续迭代)
 
-为了在 1.5B 稠密模型级别上超越 Qwen2.5、MiniCPM 和 DeepSeek-R1-Distill 等顶尖模型，我们规划了以下四大后训练技术创新改造路线：
+为了在 2B 稠密模型级别上超越 Qwen3-VL、MiniCPM 和 DeepSeek-R1-Distill 等顶尖模型，我们规划了以下后训练技术创新改造路线：
 
 ### 5.1 创新方向一：Debated-GRPO (辩论与对抗纠错强化学习)
 *   **设计**：
@@ -149,6 +154,12 @@
         $$\text{Scores} = \text{cap} \cdot \tanh\left(\frac{Q K^T}{\sqrt{d} \cdot \text{cap}}\right)$$
         稳定注意力权重，防止梯度爆炸。
     *   **FP8 Safeguard Auto-Scaler (动态校准器)**：在训练期间每 100 步对权重和激活分布进行动态统计，更新 FP8 的 Scale Factor，保障低比特运算精度。
+
+### 5.5 💡 对标 Qwen3-VL：DeepStack 多层级特征级联融合与非因果图像掩码 (P2)
+*   **问题（老技术淘汰）**：传统的 LLaVA 式 VLM 仅在 Input 层进行单次视觉 token 拼接拼接（Input-only project），导致深层网络的多模态融合浮于表面；且对图像 token 盲目使用因果自回归注意力限制了像素表征效率。
+*   **设计**：
+    *   **DeepStack Integration (深度层叠级联融合)**：废弃单纯的 Input 拼接投影。在前段多层（如第 2, 4, 6 层）设置级联层，将 Vision Transformer (ViT) 不同层级的隐层特征跨层直接融合注入，加深低阶特征与文字的强绑定。
+    *   **Non-Causal Image Masking (非因果图像自注意力掩码)**：在 LLM 的 Attention 矩阵中，允许图像 tokens 之间进行无方向的双向注意力交互（Non-Causal），仅对文本部分应用 Causal Mask，极大释放图像空间物理定位理解精度。
 
 ---
 
