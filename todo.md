@@ -27,7 +27,7 @@
     *   *目的*：从理论上将预训练收敛效率提升 1.5 ~ 2.0 倍，并在中后期有效抑止梯度发散。
 *   **2) Benchmark Leakage Prevention & Semantic Blocking (语义指纹阻断防泄露引擎)**：
     *   *设计*：在 Dataloader 阶段集成一个语义指纹过滤器。将 MMLU、GSM8K、ARC 等评测基准的问题库在内存中构建为轻量级的局部敏感哈希（LSH）或 5-gram 索引。在载入预训练数据块时进行实时对比，一旦重合度触发阈值，直接对该块执行 semantic masking（将对应 labels 设为 -100），彻底阻断 benchmark 泄露。
-    *   *目的*：确保基座模型在下游 benchmark 上的评估成绩为纯粹的 Zero-Shot 泛化，而非数据记忆。
+    *   *目的*：确保基座模型在下游 benchmark 上的评估成绩为纯粹 of Zero-Shot 泛化，而非数据记忆。
 *   **3) LG-Opt: Loss-Gradient Decoupled Rescaling (基于 Loss 偏导的梯度自适应重缩放)**：
     *   *设计*：在反向传播前，根据当前 batch 的 loss 偏离 EMA (指数移动平均) 历史 loss 的绝对偏差 $\delta = |\text{Loss} - \text{EMA\_Loss}|$，动态计算动态重缩放因子：
         *   若 $\delta > 3\sigma$（偏离过高，判定为二进制噪声或系统日志等脏数据），对该 Batch 的梯度乘 0.1 衰减权重，防止参数学坏；
@@ -45,6 +45,15 @@
 *   **问题（老技术淘汰）**：传统多模态位置编码MRoPE虽然有时间（T）、高度（H）和宽度（W）的分立，但是分块进行的，容易造成视频长文本中的时空分辨率退化。
 *   **待办**：在预训练底层实现 **Interleaved-MRoPE (交错式多模态旋转位置编码)**：
     *   将时空维度的旋转角度（$\theta_t, \theta_h, \theta_w$）在通道维度上进行交错式分布，确保每个注意力头的高低频频段同时感知 3D 关联，为后期直接具备原生 256K 超长视频理解打下物理位置表征底座。
+
+### 1.6 💡 引入 2026 前沿：Muon 优化器与 Manifold-Constrained 信号流 (P2)
+为了引入 2026 最新 DeepSeek-V4 的前沿预训练实践，规划以下底层架构级升级：
+*   **Muon 正交梯度优化器集成 (Muon Optimizer)**：
+    *   *设计*：用全新的 Muon 一阶优化器替代传统的 AdamW 来更新所有的 Transformer 权重矩阵。在每一步对梯度执行正交化（Orthogonalization），使更新几何分布正交。
+    *   *目的*：**在相同的训练 Token 量下，提升预训练收敛速度 2.5 ~ 3.0 倍**，大幅压缩算力开销。
+*   **Manifold-Constrained Hyper-Connections (mHC, 流形约束超连接)**：
+    *   *设计*：废弃传统的简单残差直连（Residual Connection），对多模态前向激活值引入流形约束映射。
+    *   *目的*：在处理极长上下文（8K/16K）和大规模跨模态注入时，彻底稳定神经信号传播，防范深层表征退化。
 
 ---
 
@@ -102,7 +111,7 @@
 *   **问题**：[data.py](file:///home/ifnodoraemon/myagent/nano-llm/data.py#L93) 的 `SequencePackingCollator` 中将多个独立会话打包进同一个长度为 `max_length` 的 sequence。但在 [model/__init__.py](file:///home/ifnodoraemon/myagent/nano-llm/model/__init__.py#L393) 的 forward 循环中，调用 `layer` 时将 `mask` 强制写死为了 `None`，导致注意力退化为全局的下三角 Causal Mask。这导致 packed sequence 中的后一会话在计算自注意力时，能完全看到前一会话的上下文，产生严重的跨样本注意力交叉泄露（Attention Cross-talk）与逻辑污染。
 *   **待办**：
     *   重构 `SequencePackingCollator` 输出会话的 `cumulative_seqlens` 边界信息。
-    *   在 `train.py` 中构造 **Block-Diagonal Causal Attention Mask (块对角线因果掩码)**，对于不同会话之间的 token 交叉将注意力置为 $-\infty$。
+    *   in `train.py` 中构造 **Block-Diagonal Causal Attention Mask (块对角线因果掩码)**，对于不同会话之间的 token 交叉将注意力置为 $-\infty$。
     *   修改 [model/__init__.py](file:///home/ifnodoraemon/myagent/nano-llm/model/__init__.py)，使 `Transformer.forward` 接受外接 `mask` 参数并透传至各层注意力机制。
 
 ### 3.6 补齐多模态 (VLM) 视觉对齐全链路训练入口 (Unlock Multimodal Alignment Entry) (P2)
@@ -153,23 +162,27 @@
     *   **Attention Logits Softcapping (软截断)**：在 Softmax 之前引入 tanh 运算，将 Scores 限制在 `[-cap, +cap]` 区间：
         $$\text{Scores} = \text{cap} \cdot \tanh\left(\frac{Q K^T}{\sqrt{d} \cdot \text{cap}}\right)$$
         稳定注意力权重，防止梯度爆炸。
-    *   **FP8 Safeguard Auto-Scaler (动态校准器)**：在训练期间每 100 步对权重 and 激活分布进行动态统计，更新 FP8 的 Scale Factor，保障低比特运算精度。
+    *   **FP8 Safeguard Auto-Scaler (动态校准器)**：在训练期间每 100 步对权重和激活分布进行动态统计，更新 FP8 的 Scale Factor，保障低比特运算精度。
 
 ### 5.5 💡 对标 Qwen3-VL：DeepStack 多层级特征级联融合与非因果图像掩码 (P2)
-*   **问题（老技术淘汰）**：传统的 LLaVA 式 VLM 仅在 Input 层进行单次视觉 token 拼接拼接（Input-only project），导致深层网络的多模态融合浮于表面；且对图像 token 盲目使用因果自回归注意力限制了像素表征效率。
 *   **设计**：
     *   **DeepStack Integration (深度层叠级联融合)**：废弃单纯的 Input 拼接投影。在前段多层（如第 2, 4, 6 层）设置级联层，将 Vision Transformer (ViT) 不同层级的隐层特征跨层直接融合注入，加深低阶特征与文字的强绑定。
     *   **Non-Causal Image Masking (非因果图像自注意力掩码)**：在 LLM 的 Attention 矩阵中，允许图像 tokens 之间进行无方向的双向注意力交互（Non-Causal），仅对文本部分应用 Causal Mask，极大释放图像空间物理定位理解精度。
 
 ### 5.6 💡 对标 DeepSeek-VL2：Dynamic Tiling 动态图块切片与 Global-Local 混合注意力 (P2)
-*   **问题**：传统多模态直接等比缩放图像，会导致极端宽高比图像（如长条图表、高分辨率 PDF 文档）在拉伸时严重失真，同时完全丢失高分辨率底图的细粒度文字细节。
 *   **设计**：
     *   **Dynamic Tiling Strategy (动态图块切片)**：输入图像首先进行等比缩放。对于高分辨率大图，自适应切割为多个 $384 \times 384$ 的局部 Tiles，同时生成一张全局 Thumbnail 缩略图 Tile，共同输入同一 Vision Encoder，以保留全局上下文和局部的极细微细节。
     *   **Global-Local Hybrid Attention (全局-局部混合注意力)**：将局部的 tiles 语义向量和全局缩略图向量以并联形式映射为 visual tokens，在 LLM 侧建立针对不同 tiles 区域的空间路由机制，实现对长 PDF 和复杂图表的无损精确 OCR 与语义问答。
 
+### 5.7 💡 对标 DeepSeek-V4-Vision：超紧凑图像离散分词与 HCA/CSA 混合长注意力 (P2)
+*   **问题**：多模态长文本输入图像时，大量的图像 tokens 依然会急剧占满 KV cache 和计算 FLOPs。
+*   **设计**：
+    *   **Ultra-compact Image Tokenization (超紧凑视觉离散分词)**：结合 2026 最新 DeepSeek-V4-Vision 实践，在 Projector 阶段引入离散量化分词机制，将每张图片的视觉表示 tokens 降为极小尺度，大幅砍掉 80% 的图像 KV 缓存，支持在极长多模态语境下并发插入数十张大图。
+    *   **CSA & HCA Hybrid Attention (压缩稀疏/极度压缩混合注意力)**：引入 Compressed Sparse Attention (CSA) 与 Heavily Compressed Attention (HCA) 联合注意力矩阵机制。对图像和冗余长程文本 tokens 进行二次低秩压缩，极度削减自回归生成的算力消耗与显存瓶颈。
+
 ---
 
-## 🚀 6. 其它系统级与速度优化 (P2 - 推理加速)
+## 🚀 7. 其它系统级与速度优化 (P2 - 推理加速)
 
 *   **生产级 REST API 流式输出**：实现 `serve/` 中 `/api/chat` 的正式流式输出。
 *   **双模型投机采样 (Speculative Decoding)**：设计 100M 级的 draft model，通过共享 KV Cache 和投机采样，将 1.5B 模型的推理吞吐提升 **2~3 倍**。
