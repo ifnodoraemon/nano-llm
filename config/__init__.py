@@ -96,6 +96,7 @@ class TrainingConfig:
     use_triton: bool = False
     use_triton_mla: bool = False
     use_lora: bool = False
+    use_checkpoint: bool = False
 
     # Data
     data_dir: str = "./data"
@@ -384,6 +385,7 @@ def config_to_model_config(cfg: TrainingConfig, **kwargs) -> "ModelConfig":
     ep_size = kwargs.pop("ep_size", cfg.ep_size)
     use_triton_mla = kwargs.pop("use_triton_mla", cfg.use_triton_mla)
     use_triton = kwargs.pop("use_triton", cfg.use_triton)
+    use_checkpoint = kwargs.pop("use_checkpoint", cfg.use_checkpoint)
 
     preset = cfg.model_preset
     if preset is None:
@@ -406,6 +408,7 @@ def config_to_model_config(cfg: TrainingConfig, **kwargs) -> "ModelConfig":
         ep_size=ep_size,
         use_triton_mla=use_triton_mla,
         use_triton=use_triton,
+        use_checkpoint=use_checkpoint,
         **kwargs,
     )
     return base

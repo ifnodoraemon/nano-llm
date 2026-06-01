@@ -10,54 +10,16 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer
 
-from model import ModelConfig, Transformer
+from model import ModelConfig, Transformer, get_deepseek_config
 from data import SFTDataset, SequencePackingCollator
 from utils.model_utils import configure_logging, count_parameters
 from utils.profiler import estimate_step_flops, calculate_mfu
+from utils.ddp_helper import init_ddp
+from utils.tokenizer_loader import load_tokenizer
+from utils.checkpoint_utils import load_checkpoint_with_fp8_translation
+from utils.training_utils import validate_dataset, assert_grad_accum_safe, get_cosine_lr, configure_optimizers
 
 logger = logging.getLogger(__name__)
-
-# ==============================================================================
-# Learning Rate Scheduler with Cosine Decay
-# ==============================================================================
-
-def get_learning_rate(step: int, max_lr: float, min_lr: float, warmup_steps: int, decay_steps: int) -> float:
-    if step < warmup_steps:
-        return max_lr * step / max(1, warmup_steps)
-    if step > decay_steps:
-        return min_lr
-    decay_ratio = (step - warmup_steps) / max(1, decay_steps - warmup_steps)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return min_lr + coeff * (max_lr - min_lr)
-
-# ==============================================================================
-# Optimizer Weight Decay Segregation
-# ==============================================================================
-
-def configure_optimizers(model, weight_decay, learning_rate, betas, device_type):
-    param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
-    
-    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-    
-    optim_groups = [
-        {"params": decay_params, "weight_decay": weight_decay},
-        {"params": nodecay_params, "weight_decay": 0.0}
-    ]
-    
-    num_decay_params = sum(p.numel() for p in decay_params)
-    num_nodecay_params = sum(p.numel() for p in nodecay_params)
-    
-    logger.info(f"Decaying weight parameters: {len(decay_params)} blocks with {num_decay_params:,} parameters")
-    logger.info(f"Non-decaying weight parameters: {len(nodecay_params)} blocks with {num_nodecay_params:,} parameters")
-    
-    fused_available = 'fused' in torch.optim.AdamW.__init__.__code__.co_varnames
-    use_fused = fused_available and device_type == 'cuda'
-    extra_args = dict(fused=True) if use_fused else dict()
-    optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-    logger.info(f"Using fused AdamW optimizer: {use_fused}")
-    
-    return optimizer
 
 
 # ==============================================================================
@@ -82,32 +44,32 @@ def train():
     parser.add_argument("--seed", type=int, default=42, help="Random initialization seed")
     
     # PEFT custom LoRA parameters
-    parser.add_argument("--use_lora", type=bool, default=False, help="Train only custom LoRA adapters from scratch")
+    parser.add_argument("--use_lora", action="store_true", help="Train only custom LoRA adapters from scratch")
     parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank dimension size")
     parser.add_argument("--lora_alpha", type=float, default=16.0, help="LoRA alpha scaling multiplier")
     args = parser.parse_args()
 
     # 1. Initialize PyTorch DDP
-    ddp = "WORLD_SIZE" in os.environ
-    if ddp:
-        dist.init_process_group(backend="nccl")
-        ddp_rank = int(os.environ["RANK"])
-        ddp_local_rank = int(os.environ["LOCAL_RANK"])
-        ddp_world_size = int(os.environ["WORLD_SIZE"])
-        device = f"cuda:{ddp_local_rank}"
-        torch.cuda.set_device(device)
-        is_master = ddp_rank == 0
-    else:
-        ddp_rank = 0
-        ddp_local_rank = 0
-        ddp_world_size = 1
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        is_master = True
+    dist_info = init_ddp()
+    ddp = dist_info["ddp"]
+    ddp_rank = dist_info["rank"]
+    ddp_local_rank = dist_info["local_rank"]
+    ddp_world_size = dist_info["world_size"]
+    device = dist_info["device"]
+    is_master = dist_info["is_master"]
 
     # Setup master logging
     log_level = logging.INFO if is_master else logging.WARNING
     configure_logging(level=log_level)
-    
+
+    from utils.experiment_tracker import ExperimentTracker
+    tracker = ExperimentTracker(
+        project="nano-llm",
+        config=vars(args),
+        mode="offline" if is_master else "disabled",
+        log_dir="./logs",
+    )
+
     logger.info(f"--- DDP Node initialized | Rank: {ddp_rank} | Local Rank: {ddp_local_rank} | World Size: {ddp_world_size} ---")
     
     torch.manual_seed(args.seed + ddp_rank)
@@ -118,21 +80,11 @@ def train():
 
     # 2. Tokenizer & Dataset Loader
     logger.info("Initializing tokenizer...")
-    from serve import CustomTokenizerAdapter
-    if os.path.exists("./data/custom_tokenizer.json"):
-        logger.info("Found custom trained BPE tokenizer. Loading from ./data/custom_tokenizer.json...")
-        from train_tokenizer import CustomBPETokenizer
-        raw_tok = CustomBPETokenizer()
-        raw_tok.load("./data/custom_tokenizer.json")
-        tokenizer = CustomTokenizerAdapter(raw_tok)
-    else:
-        logger.warning("Custom tokenizer not found. Falling back to AutoTokenizer...")
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
-    
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id or 0
+    tokenizer = load_tokenizer(fallback_model_name=args.model_name_or_path)
 
     dataset = SFTDataset(data_path=args.data_path, tokenizer=tokenizer, max_length=args.max_length)
+    validate_dataset(dataset, tokenizer=tokenizer, name="SFT training dataset")
+    
     collator = SequencePackingCollator(pad_token_id=tokenizer.pad_token_id, max_length=args.max_length)
 
     sampler = DistributedSampler(dataset, num_replicas=ddp_world_size, rank=ddp_rank, shuffle=True) if ddp else None
@@ -144,24 +96,25 @@ def train():
         collate_fn=collator,
         pin_memory=True
     )
+    assert_grad_accum_safe(dataloader, args.grad_accum_steps, args.batch_size)
 
     # 3. Load Modern LLaMA Model with custom LoRA configurations
     logger.info("Assembling custom LLaMA Transformer architecture...")
     base_checkpoint_path = "./outputs/checkpoint_pretrain.pt"
+    restored_step = 0
+    has_ckpt = False
     if os.path.exists(base_checkpoint_path):
         logger.info(f"Found base pre-trained checkpoint at {base_checkpoint_path}. Loading configuration and weights...")
-        checkpoint = torch.load(base_checkpoint_path, map_location=device, weights_only=False)
-        model_config = checkpoint["config"]
+        model_config, state_dict = load_checkpoint_with_fp8_translation(base_checkpoint_path, map_location=device)
         model = Transformer(model_config).to(device)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        model.load_state_dict(state_dict)
+        has_ckpt = True
     else:
         logger.warning("Base pre-trained checkpoint not found. Instantiating model from scratch...")
-        model_config = ModelConfig(
+        model_config = get_deepseek_config(
+            "tiny",
             block_size=args.max_length,
             vocab_size=len(tokenizer),
-            n_layer=28,   
-            n_head=16,
-            n_embd=2048,
             lora_r=args.lora_r if args.use_lora else 0,
             lora_alpha=args.lora_alpha
         )
@@ -204,117 +157,142 @@ def train():
     # 5. Training Epoch Loop
     total_steps = len(dataloader) * args.epochs
     decay_steps = total_steps
-    step_counter = 0
+    step_counter = restored_step if has_ckpt else 0
     
+    if is_master:
+        tracker.log_config({
+            "n_layer": model_config.n_layer, "n_head": model_config.n_head, "n_embd": model_config.n_embd,
+            "total_params": param_report["total_params"], "trainable_params": param_report["trainable_params"],
+            "batch_size": args.batch_size, "max_length": args.max_length,
+            "grad_accum_steps": args.grad_accum_steps, "epochs": args.epochs,
+            "max_lr": args.max_lr,
+        })
     logger.info(f"🚀 Launching SFT DDP loop: total steps={total_steps} | micro-batch={args.batch_size} | accum steps={args.grad_accum_steps}")
     
-    for epoch in range(args.epochs):
-        if sampler is not None:
-            sampler.set_epoch(epoch)
-            
-        model.train()
-        epoch_loss = 0.0
-        
-        optimizer.zero_grad(set_to_none=True)
-        start_time = time.time()
-        
-        for batch_idx, batch in enumerate(dataloader):
-            input_ids = batch["input_ids"].to(device, non_blocking=True)
-            labels = batch["labels"].to(device, non_blocking=True)
-            
-            dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-            with torch.amp.autocast("cuda", dtype=dtype, enabled=torch.cuda.is_available()):
-                logits, loss = model(input_ids, targets=labels)
-                loss = loss / args.grad_accum_steps
-                
-            epoch_loss += loss.item() * args.grad_accum_steps
-            
-            if ddp:
-                model.require_backward_grad_sync = (batch_idx + 1) % args.grad_accum_steps == 0
-                
-            if torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
-                
-            if (batch_idx + 1) % args.grad_accum_steps == 0:
-                lr = get_learning_rate(
-                    step=step_counter,
-                    max_lr=args.max_lr,
-                    min_lr=args.min_lr,
-                    warmup_steps=args.warmup_steps,
-                    decay_steps=decay_steps
-                )
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = lr
-                    
-                if args.clip_grad > 0:
-                    if torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
-                    else:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
-                        
+    try:
+        for epoch in range(args.epochs):
+            if sampler is not None:
+                sampler.set_epoch(epoch)
+
+            model.train()
+            epoch_loss = 0.0
+
+            optimizer.zero_grad(set_to_none=True)
+            start_time = time.time()
+
+            for batch_idx, batch in enumerate(dataloader):
+                input_ids = batch["input_ids"].to(device, non_blocking=True)
+                labels = batch["labels"].to(device, non_blocking=True)
+
+                dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+                with torch.amp.autocast("cuda", dtype=dtype, enabled=torch.cuda.is_available()):
+                    logits, loss, _ = model(input_ids, targets=labels)
+                    loss = loss / args.grad_accum_steps
+
+                epoch_loss += loss.item() * args.grad_accum_steps
+
+                if ddp:
+                    model.require_backward_grad_sync = (batch_idx + 1) % args.grad_accum_steps == 0
+
                 if torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
-                    scaler.step(optimizer)
-                    scaler.update()
+                    scaler.scale(loss).backward()
                 else:
-                    optimizer.step()
-                    
-                optimizer.zero_grad(set_to_none=True)
-                step_counter += 1
-                
-                # Rank 0 Master logging with MFU (Model FLOPs Utilization) tracking!
-                if is_master and step_counter % 10 == 0:
-                    elapsed = time.time() - start_time
-                    tokens_processed = batch["input_ids"].numel() * args.grad_accum_steps * ddp_world_size
-                    throughput = tokens_processed / elapsed
-                    
-                    # Calculate MFU against peak hardware FLOPS
-                    mfu = calculate_mfu(
-                        step_flops=step_flops,
-                        elapsed_time=elapsed,
-                        grad_accum_steps=args.grad_accum_steps,
-                        world_size=ddp_world_size
-                    )
-                    
-                    logger.info(
-                        f"Epoch {epoch+1} | Step {step_counter}/{total_steps//args.grad_accum_steps} | "
-                        f"Loss: {loss.item()*args.grad_accum_steps:.4f} | LR: {lr:.2e} | "
-                        f"Speed: {throughput:.0f} tok/s | MFU: {mfu:.1f}% | Time: {elapsed:.2f}s"
-                    )
-                    start_time = time.time()
-                    
-                if is_master and step_counter % args.save_steps == 0:
-                    checkpoint_path = os.path.join(args.output_dir, f"checkpoint_sft_step_{step_counter}.pt")
-                    logger.info(f"Saving step checkpoint to {checkpoint_path}...")
-                    
-                    raw_model = model.module if ddp else model
-                    torch.save({
-                        "model_state_dict": raw_model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "config": model_config,
-                        "step": step_counter
-                    }, checkpoint_path)
+                    loss.backward()
 
-        avg_epoch_loss = epoch_loss / len(dataloader)
+                if (batch_idx + 1) % args.grad_accum_steps == 0:
+                    lr = get_cosine_lr(
+                        step=step_counter,
+                        max_lr=args.max_lr,
+                        min_lr=args.min_lr,
+                        warmup_steps=args.warmup_steps,
+                        decay_steps=decay_steps
+                    )
+                    for param_group in optimizer.param_groups:
+                        param_group["lr"] = lr
+
+                    if args.clip_grad > 0:
+                        if torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+                        else:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+
+                    if torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+
+                    optimizer.zero_grad(set_to_none=True)
+                    step_counter += 1
+
+                    # Rank 0 Master logging with MFU (Model FLOPs Utilization) tracking!
+                    if is_master and step_counter % 10 == 0:
+                        elapsed = time.time() - start_time
+                        tokens_processed = batch["input_ids"].numel() * args.grad_accum_steps * ddp_world_size
+                        throughput = tokens_processed / elapsed
+
+                        # Calculate MFU against peak hardware FLOPS
+                        mfu = calculate_mfu(
+                            step_flops=step_flops,
+                            elapsed_time=elapsed,
+                            grad_accum_steps=args.grad_accum_steps,
+                            world_size=ddp_world_size
+                        )
+
+                        tracker.log({
+                            "sft/loss": loss.item() * args.grad_accum_steps,
+                            "sft/lr": lr,
+                            "sft/throughput": throughput,
+                            "sft/mfu": mfu,
+                        }, step=step_counter)
+
+                        logger.info(
+                            f"Epoch {epoch+1} | Step {step_counter}/{total_steps//args.grad_accum_steps} | "
+                            f"Loss: {loss.item()*args.grad_accum_steps:.4f} | LR: {lr:.2e} | "
+                            f"Speed: {throughput:.0f} tok/s | MFU: {mfu:.1f}% | Time: {elapsed:.2f}s"
+                        )
+                        start_time = time.time()
+
+                    if is_master and step_counter % args.save_steps == 0:
+                        checkpoint_path = os.path.join(args.output_dir, f"checkpoint_sft_step_{step_counter}.pt")
+                        logger.info(f"Saving step checkpoint to {checkpoint_path}...")
+
+                        raw_model = model.module if ddp else model
+                        torch.save({
+                            "model_state_dict": raw_model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "config": model_config,
+                            "step": step_counter
+                        }, checkpoint_path)
+
+            avg_epoch_loss = epoch_loss / len(dataloader)
+            if is_master:
+                logger.info(f"--- Epoch {epoch+1} completed! Average Loss: {avg_epoch_loss:.4f} ---")
+
+        # Save final model state
         if is_master:
-            logger.info(f"--- Epoch {epoch+1} completed! Average Loss: {avg_epoch_loss:.4f} ---")
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            final_path = os.path.join(args.output_dir, "checkpoint_sft.pt")
+            timestamped_path = os.path.join(args.output_dir, f"checkpoint_sft_{timestamp}.pt")
             
-    # Save final model state
-    if is_master:
-        final_path = os.path.join(args.output_dir, "checkpoint_sft.pt")
-        logger.info(f"Saving final model checkpoint to {final_path}...")
-        raw_model = model.module if ddp else model
-        torch.save({
-            "model_state_dict": raw_model.state_dict(),
-            "config": model_config,
-            "step": step_counter
-        }, final_path)
-        
-    if ddp:
-        dist.destroy_process_group()
-    logger.info("nano-llm: SFT Succeeded!")
+            logger.info(f"Saving final model checkpoint to {final_path} and {timestamped_path}...")
+            raw_model = model.module if ddp else model
+            checkpoint_payload = {
+                "model_state_dict": raw_model.state_dict(),
+                "config": model_config,
+                "step": step_counter
+            }
+            torch.save(checkpoint_payload, final_path)
+            torch.save(checkpoint_payload, timestamped_path)
 
+        if ddp:
+            dist.destroy_process_group()
+        logger.info("nano-llm: SFT Succeeded!")
+
+    finally:
+        if is_master:
+            tracker.finish()
 if __name__ == "__main__":
     train()

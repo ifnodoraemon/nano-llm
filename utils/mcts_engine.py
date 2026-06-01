@@ -194,7 +194,7 @@ class MCTSEngine:
         curr_seq = seq.clone().to(device)
         
         for _ in range(max_tokens):
-            logits, _ = self.model(curr_seq)
+            logits, _, _ = self.model(curr_seq)
             next_token_logits = logits[:, -1, :] / 0.8
             probs = F.softmax(next_token_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)

@@ -2,39 +2,126 @@ name: nano-llm CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 permissions:
   contents: read
 
 jobs:
-  test:
+  unit-tests:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout Codebase
-      uses: actions/checkout@v4
+      - name: Checkout Codebase
+        uses: actions/checkout@v4
 
-    - name: Set up Python 3.10
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.10"
-        cache: 'pip'
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
 
-    - name: Install System Dependencies
-      run: |
-        python -m pip install --upgrade pip
-        # Install dependencies directly from pyproject.toml
-        pip install .[dev]
+      - name: Install System Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install .[dev]
 
-    - name: Run Black Code Style Lint Check
-      run: |
-        # Check formatting compliance (non-blocking, just outputs differences)
-        black --check --diff .
+      - name: Run Black Code Style Check
+        run: black --check --diff . || true
 
-    - name: Execute PyTorch Unit Tests
-      run: |
-        # Run all test suites inside the tests/ folder
-        python -m unittest discover -s tests -p "test_*.py"
+      - name: Execute PyTorch Unit Tests (CPU)
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
+  import-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Codebase
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers safetensors
+
+      - name: Verify Import of All Modules
+        run: |
+          python -c "from model import ModelConfig, Transformer, get_deepseek_config; print('model OK')"
+          python -c "from config import load_config, detect_hardware, MODEL_PRESETS; print('config OK')"
+          python -c "from configuration_nano_lm import NanoLMConfig; print('nano_lm_config OK')"
+          python -c "from utils.tokenizer_loader import load_tokenizer; print('tokenizer_loader OK')"
+          python -c "from utils.checkpoint_utils import translate_fp8_keys, load_checkpoint_with_fp8_translation; print('checkpoint_utils OK')"
+
+  smoke-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Codebase
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers safetensors numpy fastapi uvicorn huggingface-hub
+
+      - name: Smoke Test — Model Forward Pass
+        run: |
+          python -c "
+          import torch
+          from model import Transformer, ModelConfig, get_deepseek_config
+          config = get_deepseek_config('tiny')
+          model = Transformer(config)
+          x = torch.randint(0, 1000, (2, 64))
+          logits, loss, aux = model(x, targets=x)
+          assert logits.shape == (2, 64, config.vocab_size), f'Expected (2,64,{config.vocab_size}) got {logits.shape}'
+          assert loss is not None
+          print(f'Forward pass OK, loss={loss.item():.4f}')
+          "
+
+      - name: Smoke Test — Critical Module Imports
+        run: |
+          python -c "
+          from grpo.engine import generate_completions, compute_action_logprobs
+          from grpo.rewards import evaluate_completion_rewards, GRPORewardScaler, AdaptiveKLTuner
+          from serve.generation import CustomTokenizerAdapter, generate_with_static_cache
+          from utils.training_utils import validate_dataset, assert_grad_accum_safe, get_cosine_lr, configure_optimizers
+          print('All modules import OK')
+          "
+
+      - name: Smoke Test — Config & Hardware Detection
+        run: |
+          python -c "
+          from config import load_config, detect_hardware, MODEL_PRESETS
+          hw = detect_hardware()
+          print(f'Hardware: {hw.num_gpus} GPUs')
+          cfg = load_config('dev')
+          print(f'Dev config: model={cfg.model_size}, batch={cfg.batch_size}, steps={cfg.max_steps}')
+          "
+
+      - name: Smoke Test — HF Config & Model
+        run: |
+          python -c "
+          from configuration_nano_lm import NanoLMConfig
+          from modeling_nano_lm import NanoLMForCausalLM
+          config = NanoLMConfig(n_layer=2, n_head=4, n_embd=64, block_size=128, vocab_size=1000)
+          print('HF config and model OK')
+          "
+
+      - name: Run Unit Tests
+        run: python -m unittest discover -s tests -p "test_*.py" -v

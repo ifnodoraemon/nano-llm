@@ -41,6 +41,7 @@ def main():
     parser.add_argument("--ep_size", type=int, default=1, help="Expert Parallel size")
     parser.add_argument("--use_triton_mla", type=str, default="False", help="Use Triton MLA kernel")
     parser.add_argument("--use_triton", type=str, default="False", help="Use Triton RMSNorm and SwiGLU kernels")
+    parser.add_argument("--use_checkpoint", type=str, default="False", help="Enable activation checkpointing to save VRAM")
     parser.add_argument("--data_mix", type=str, default=None,
                         choices=["balanced", "code_heavy", "zh_focused", "english_only"],
                         help="Data mixing preset for multi-domain pretraining")
@@ -219,7 +220,8 @@ def main():
         pp_size=args.pp_size,
         ep_size=args.ep_size,
         use_triton_mla=args.use_triton_mla.lower() == "true",
-        use_triton=args.use_triton.lower() == "true"
+        use_triton=args.use_triton.lower() == "true",
+        use_checkpoint=args.use_checkpoint.lower() == "true",
     )
     model = Transformer(config)
     
@@ -328,7 +330,7 @@ def main():
                 def loss_fn(pred_logits, targets_mb):
                     return F.cross_entropy(pred_logits.view(-1, pred_logits.size(-1)), targets_mb.view(-1), ignore_index=-100)
 
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
                     losses = scheduler.run_1f1b(
                         micro_batches=micro_batches_x,
                         targets=micro_batches_y,
@@ -346,7 +348,7 @@ def main():
                         model.require_backward_grad_sync = (micro_step == args.grad_accum_steps - 1)
 
                     # Forward pass under native bfloat16 AMP
-                    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
                         logits, loss, _ = model(x, targets=y)
                         loss = loss / args.grad_accum_steps
 
@@ -419,16 +421,19 @@ def main():
 
         # 8. Save final pre-trained state dictionary
         if master_process:
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             checkpoint_path = os.path.join(args.out_dir, "checkpoint_pretrain.pt")
-            logger.info(f"💾 Saving final pre-trained checkpoint to: {checkpoint_path}")
-            torch.save(
-                {
-                    "model_state_dict": raw_model.state_dict(),
-                    "config": config,
-                    "step": step
-                },
-                checkpoint_path
-            )
+            timestamped_path = os.path.join(args.out_dir, f"checkpoint_pretrain_{timestamp}.pt")
+            
+            logger.info(f"💾 Saving final pre-trained checkpoint to: {checkpoint_path} and {timestamped_path}")
+            checkpoint_payload = {
+                "model_state_dict": raw_model.state_dict(),
+                "config": config,
+                "step": step
+            }
+            torch.save(checkpoint_payload, checkpoint_path)
+            torch.save(checkpoint_payload, timestamped_path)
             logger.info("✅ Pre-training stage successfully completed!")
 
     finally:

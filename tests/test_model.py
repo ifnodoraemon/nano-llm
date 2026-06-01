@@ -122,7 +122,7 @@ class TestTransformerModules(unittest.TestCase):
             
         # 1. Prefill stage: prompt of length 10
         x_prefill = torch.randint(0, 1000, (1, 10))
-        logits, _ = model(x_prefill, start_pos=0, kv_caches=kv_caches)
+        logits, _, _ = model(x_prefill, start_pos=0, kv_caches=kv_caches)
         
         self.assertEqual(logits.shape, (1, 1, 1000))
         
@@ -134,7 +134,7 @@ class TestTransformerModules(unittest.TestCase):
         
         # 2. Decode stage: single token at start_pos = 10
         x_decode = torch.randint(0, 1000, (1, 1))
-        logits_decode, _ = model(x_decode, start_pos=10, kv_caches=kv_caches)
+        logits_decode, _, _ = model(x_decode, start_pos=10, kv_caches=kv_caches)
         
         self.assertEqual(logits_decode.shape, (1, 1, 1000))
         # Cache index 10 should now be populated
@@ -162,13 +162,13 @@ class TestTransformerModules(unittest.TestCase):
         targets = torch.randint(0, 1000, (1, 5))
         
         # 1. Forward pass without targets (inference)
-        logits, loss = model(tokens, pixel_values=pixel_values)
+        logits, loss, _ = model(tokens, pixel_values=pixel_values)
         self.assertIsNone(loss)
         # Should return logits of the full sequence
         self.assertEqual(logits.shape, (1, 9, 1000))
         
         # 2. Forward pass with targets (training)
-        logits_train, loss_train = model(tokens, pixel_values=pixel_values, targets=targets)
+        logits_train, loss_train, _ = model(tokens, pixel_values=pixel_values, targets=targets)
         self.assertIsNotNone(loss_train)
         self.assertEqual(logits_train.shape, (1, 9, 1000)) # 4 vision + 5 text tokens = 9 total
         self.assertTrue(loss_train.item() > 0.0)

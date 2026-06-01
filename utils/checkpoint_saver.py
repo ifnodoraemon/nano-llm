@@ -8,6 +8,16 @@ from typing import Dict, Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+def _to_cpu(obj):
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().clone()
+    elif isinstance(obj, dict):
+        return {k: _to_cpu(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_to_cpu(v) for v in obj]
+    else:
+        return obj
+
 class BackgroundCheckpointSaver:
     """
     Non-blocking, thread-safe asynchronous checkpoint writer.
@@ -60,12 +70,12 @@ class BackgroundCheckpointSaver:
         
         # Extract base state dict (unwrap DDP if needed)
         raw_model = model.module if hasattr(model, "module") else model
-        model_state_cpu = {k: v.cpu().clone() for k, v in raw_model.state_dict().items()}
-        optimizer_state_cpu = copy.deepcopy(optimizer.state_dict())
+        model_state_cpu = {k: v.detach().cpu().clone() for k, v in raw_model.state_dict().items()}
+        optimizer_state_cpu = _to_cpu(optimizer.state_dict())
         
         scheduler_state = None
         if lr_scheduler is not None:
-            scheduler_state = copy.deepcopy(lr_scheduler.state_dict())
+            scheduler_state = _to_cpu(lr_scheduler.state_dict())
             
         checkpoint_data = {
             "model_state_dict": model_state_cpu,
@@ -143,7 +153,14 @@ class ElasticRestoreManager:
         
         # Load weights
         raw_model = model.module if hasattr(model, "module") else model
-        raw_model.load_state_dict(checkpoint["model_state_dict"])
+        state_dict = checkpoint["model_state_dict"]
+        # Ensure older checkpoints without _is_scale_initialized are compatible
+        for k in list(state_dict.keys()):
+            if "x_scale" in k:
+                init_key = k.replace("x_scale", "_is_scale_initialized")
+                if init_key not in state_dict:
+                    state_dict[init_key] = torch.tensor(True)
+        raw_model.load_state_dict(state_dict)
         
         # Load optimizer
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
