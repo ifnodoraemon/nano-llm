@@ -18,6 +18,7 @@ outputs_dpo/
 data/*.bin
 data/*.json
 data/*.jsonl
+data/eval/*.jsonl
 data/raw_crawled/
 data/cleaned_corpus/
 
