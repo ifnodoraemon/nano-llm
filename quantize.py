@@ -75,12 +75,22 @@ def quantize_model_checkpoint(
     """
     Loads SFT/DPO checkpoint, parses linear weight layers, 
     applies RTN compression, and saves a simulated quantized checkpoint.
+    Supports both PyTorch (.pt/.bin) checkpoints and Safetensors (.safetensors) files.
     """
     logger.info(f"Loading checkpoint state from: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    state_dict = checkpoint.get("model_state_dict", checkpoint.get("model"))
-    config = checkpoint["config"]
     
+    is_safetensors = checkpoint_path.endswith(".safetensors")
+    
+    if is_safetensors:
+        from safetensors.torch import load_file
+        state_dict = load_file(checkpoint_path)
+        checkpoint = {}
+        config = None
+    else:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        state_dict = checkpoint.get("model_state_dict", checkpoint.get("model"))
+        config = checkpoint.get("config", None)
+        
     # Linear layer weight keys that represent projections (wq, wk, wv, wo, w1, w2, w3, output)
     target_layer_keys = [
         "attention.wq.base_layer.weight",
@@ -97,7 +107,16 @@ def quantize_model_checkpoint(
         "feed_forward.w1.weight",
         "feed_forward.w2.weight",
         "feed_forward.w3.weight",
-        "output.weight"
+        "output.weight",
+        # HuggingFace compatible format suffixes (safetensors keys)
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.o_proj.weight",
+        "mlp.gate_proj.weight",
+        "mlp.down_proj.weight",
+        "mlp.up_proj.weight",
+        "lm_head.weight"
     ]
     
     quantized_state_dict = {}
@@ -147,13 +166,26 @@ def quantize_model_checkpoint(
     logger.info(f"🏎️  Compression Ratio: {compression_ratio:.2f}x")
     logger.info("=======================================================================")
     
-    # Save checkpoint (normalize key to model_state_dict)
-    checkpoint["model_state_dict"] = quantized_state_dict
-    checkpoint.pop("model", None)  # Remove 'model' key if exists (GRPO compat)
-    checkpoint["quantized_bits"] = bits
-    
-    logger.info(f"Writing quantized model checkpoint to: {output_path}...")
-    torch.save(checkpoint, output_path)
+    # Save checkpoint
+    if output_path.endswith(".safetensors"):
+        from safetensors.torch import save_file
+        logger.info(f"Writing quantized model checkpoint to safetensors: {output_path}...")
+        save_file(quantized_state_dict, output_path)
+    else:
+        # PyTorch format
+        if is_safetensors:
+            checkpoint = {
+                "model_state_dict": quantized_state_dict,
+                "quantized_bits": bits
+            }
+        else:
+            checkpoint["model_state_dict"] = quantized_state_dict
+            checkpoint.pop("model", None)  # Remove 'model' key if exists (GRPO compat)
+            checkpoint["quantized_bits"] = bits
+        
+        logger.info(f"Writing quantized model checkpoint to: {output_path}...")
+        torch.save(checkpoint, output_path)
+        
     logger.info("Quantization successfully completed!")
 
 # ==============================================================================

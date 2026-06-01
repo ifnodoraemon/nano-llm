@@ -12,6 +12,8 @@ import torch.distributed as dist
 
 from model import ModelConfig, Transformer, convert_to_fp8
 from utils.profiler import estimate_step_flops, calculate_mfu
+from config import load_config, config_to_model_config
+from utils.training_utils import get_cosine_lr, configure_optimizers
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -39,6 +41,9 @@ def main():
     parser.add_argument("--ep_size", type=int, default=1, help="Expert Parallel size")
     parser.add_argument("--use_triton_mla", type=str, default="False", help="Use Triton MLA kernel")
     parser.add_argument("--use_triton", type=str, default="False", help="Use Triton RMSNorm and SwiGLU kernels")
+    parser.add_argument("--data_mix", type=str, default=None,
+                        choices=["balanced", "code_heavy", "zh_focused", "english_only"],
+                        help="Data mixing preset for multi-domain pretraining")
     args = parser.parse_args()
 
     # 0. Initialize hardware telemetry monitor
@@ -93,6 +98,14 @@ def main():
         device = "cuda" if torch.cuda.is_available() else "cpu"
         seed_offset = 0
 
+    from utils.experiment_tracker import ExperimentTracker
+    tracker = ExperimentTracker(
+        project="nano-llm",
+        config=vars(args),
+        mode="offline" if master_process else "disabled",
+        log_dir="./logs",
+    )
+
     if master_process:
         os.makedirs(args.out_dir, exist_ok=True)
         logger.info("Initializing nano-llm pre-training environment...")
@@ -121,6 +134,14 @@ def main():
     train_data = np.memmap(train_bin, dtype=np.uint16, mode="r")
     val_data = np.memmap(val_bin, dtype=np.uint16, mode="r")
 
+    # Guard assert: ensure dataset has enough tokens for gradient accumulation steps
+    tokens_needed = args.batch_size * args.block_size * args.grad_accum_steps * ddp_world_size
+    if len(train_data) < tokens_needed:
+        raise AssertionError(
+            f"Pretraining dataset {train_bin} has {len(train_data):,} tokens, which is smaller "
+            f"than the {tokens_needed:,} tokens required for a single gradient accumulation step."
+        )
+
     def get_batch(split, batch_size=None):
         data = train_data if split == "train" else val_data
         bs = batch_size if batch_size is not None else args.batch_size
@@ -128,7 +149,7 @@ def main():
         ix = torch.randint(len(data) - args.block_size - 1, (bs,))
         x = torch.stack([torch.from_numpy((data[i : i + args.block_size]).astype(np.int64)) for i in ix])
         y = torch.stack([torch.from_numpy((data[i + 1 : i + 1 + args.block_size]).astype(np.int64)) for i in ix])
-        
+
         # Pin memory for high-throughput GPU transfer
         if "cuda" in device:
             x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
@@ -136,21 +157,70 @@ def main():
             x, y = x.to(device), y.to(device)
         return x, y
 
+    # 2b. Optional multi-domain data mixing via DynamicDataMixer
+    data_mixer_iter = None
+    if args.data_mix is not None:
+        manifest_path = os.path.join(args.data_dir, "data_manifest.json")
+        if not os.path.exists(manifest_path):
+            if master_process:
+                logger.warning(f"Data manifest not found at {manifest_path} — falling back to single-domain data")
+        else:
+            import json as _json
+            with open(manifest_path, "r") as f:
+                manifest = _json.load(f)
+            preset = manifest.get("presets", {}).get(args.data_mix)
+            if preset is None:
+                if master_process:
+                    logger.warning(f"Data mix preset '{args.data_mix}' not found in manifest — falling back to default")
+            else:
+                if master_process:
+                    logger.info(f"Data mix preset '{args.data_mix}': {preset['description']}")
+                    logger.info(f"Sources: {preset['sources']}")
+
+                from utils.tokenizer_loader import load_tokenizer
+                tokenizer = load_tokenizer(fallback_model_name="gpt2")
+
+                from utils.data_mixer import DynamicDataMixer
+                data_mixer = DynamicDataMixer(
+                    sources=preset["sources"],
+                    tokenizer=tokenizer,
+                    block_size=args.block_size,
+                    buffer_size=5000,
+                    seed=1337 + seed_offset,
+                )
+                data_mixer_iter = iter(data_mixer)
+
+                def get_batch(split, batch_size=None):
+                    """Get a batch from the multi-domain data mixer (overrides memmap version)."""
+                    bs = batch_size if batch_size is not None else args.batch_size
+                    xs, ys = [], []
+                    for _ in range(bs):
+                        sample = next(data_mixer_iter)
+                        xs.append(sample["input_ids"])
+                        ys.append(sample["labels"])
+                    x = torch.stack(xs)
+                    y = torch.stack(ys)
+                    if "cuda" in device:
+                        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+                    else:
+                        x, y = x.to(device), y.to(device)
+                    return x, y
+
+                if master_process:
+                    logger.info(f"Multi-domain data mixer active — preset: {args.data_mix}")
+
     # 3. Build model Config & Model
-    config = ModelConfig(
+    cfg = load_config(mode="prod" if args.max_steps > 500 else "dev", num_gpus=ddp_world_size)
+    config = config_to_model_config(
+        cfg,
         block_size=args.block_size,
-        vocab_size=10005,
-        n_layer=4,       # Light config for fast startup & pre-training stability
-        n_head=8,
-        n_embd=512,
-        vision_dim=None,  # Pure Causal Text Pre-training
+        vision_dim=None,
         tp_size=args.tp_size,
         pp_size=args.pp_size,
         ep_size=args.ep_size,
         use_triton_mla=args.use_triton_mla.lower() == "true",
         use_triton=args.use_triton.lower() == "true"
     )
-    
     model = Transformer(config)
     
     # 4. Native FP8 Conversion Optimization
@@ -168,14 +238,12 @@ def main():
         logger.info(f"Model Architecture: LLaMA Causal Transformer | Parameters: {total_params:,}")
 
     # Set up optimizer ( nanoGPT-style weight decay grouping )
-    param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
-    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-    optim_groups = [
-        {"params": decay_params, "weight_decay": args.weight_decay},
-        {"params": nodecay_params, "weight_decay": 0.0}
-    ]
-    optimizer = torch.optim.AdamW(optim_groups, lr=args.lr, betas=(0.9, 0.95), eps=1e-8)
+    optimizer = configure_optimizers(
+        model=model,
+        weight_decay=args.weight_decay,
+        learning_rate=args.lr,
+        device_type="cuda" if "cuda" in device else "cpu"
+    )
 
     # 5. Shard model through DDP or Pipeline Parallel
     from utils.pipeline_parallel import PipelineStage, OneFOneBScheduler, get_pp_size, get_pp_rank
@@ -211,16 +279,7 @@ def main():
     if has_ckpt:
         restored_step, _, _ = restore_mgr.restore_training_state(model, optimizer)
 
-    # 6. Cosine learning rate scheduling calculator
-    def get_lr(step):
-        if step < args.warmup_steps:
-            return args.lr * (step + 1) / (args.warmup_steps + 1)
-        if step > args.max_steps:
-            return args.min_lr
-        # Cosine decay factor calculation
-        decay_ratio = (step - args.warmup_steps) / (args.max_steps - args.warmup_steps)
-        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-        return args.min_lr + coeff * (args.lr - args.min_lr)
+
 
     # 7. Pre-training Optimization Loop
     model.train()
@@ -243,125 +302,142 @@ def main():
 
     if master_process:
         logger.info("🚀 Launching optimization steps. Streaming real-time telemetry metrics...")
+        tracker.log_config({
+            "n_layer": config.n_layer, "n_head": config.n_head, "n_embd": config.n_embd,
+            "total_params": n_params, "batch_size": args.batch_size,
+            "block_size": args.block_size, "max_steps": args.max_steps,
+        })
 
-    while step < args.max_steps:
-        # Determine learning rate
-        lr = get_lr(step)
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
+    try:
+        while step < args.max_steps:
+            # Determine learning rate
+            lr = get_cosine_lr(step=step, max_lr=args.lr, min_lr=args.min_lr, warmup_steps=args.warmup_steps, decay_steps=args.max_steps)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
 
-        # Batch accumulation loop
-        optimizer.zero_grad(set_to_none=True)
-        loss_accum = 0.0
+            # Batch accumulation loop
+            optimizer.zero_grad(set_to_none=True)
+            loss_accum = 0.0
 
-        if pp_size > 1:
-            # Slice input batch into micro-batches for 1F1B
-            x, y = get_batch("train", batch_size=args.batch_size * args.grad_accum_steps)
-            micro_batches_x = list(x.chunk(args.grad_accum_steps, dim=0))
-            micro_batches_y = list(y.chunk(args.grad_accum_steps, dim=0))
-            
-            def loss_fn(pred_logits, targets_mb):
-                return F.cross_entropy(pred_logits.view(-1, pred_logits.size(-1)), targets_mb.view(-1), ignore_index=-100)
-                
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                losses = scheduler.run_1f1b(
-                    micro_batches=micro_batches_x,
-                    targets=micro_batches_y,
-                    loss_fn=loss_fn,
-                    device=torch.device(device)
-                )
-                
-            loss_accum = sum(l.detach().item() for l in losses) / args.grad_accum_steps if losses else 0.0
-        else:
-            for micro_step in range(args.grad_accum_steps):
-                x, y = get_batch("train")
-                
-                # Disable DDP gradient sync on intermediate micro-steps
-                if ddp:
-                    model.require_backward_grad_sync = (micro_step == args.grad_accum_steps - 1)
-                    
-                # Forward pass under native bfloat16 AMP
+            if pp_size > 1:
+                # Slice input batch into micro-batches for 1F1B
+                x, y = get_batch("train", batch_size=args.batch_size * args.grad_accum_steps)
+                micro_batches_x = list(x.chunk(args.grad_accum_steps, dim=0))
+                micro_batches_y = list(y.chunk(args.grad_accum_steps, dim=0))
+
+                def loss_fn(pred_logits, targets_mb):
+                    return F.cross_entropy(pred_logits.view(-1, pred_logits.size(-1)), targets_mb.view(-1), ignore_index=-100)
+
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                    logits, loss = model(x, targets=y)
-                    loss = loss / args.grad_accum_steps
-                    
-                loss_accum += loss.detach().item()
-                
-                # Backward pass
-                loss.backward()
+                    losses = scheduler.run_1f1b(
+                        micro_batches=micro_batches_x,
+                        targets=micro_batches_y,
+                        loss_fn=loss_fn,
+                        device=torch.device(device)
+                    )
 
-        # Clip global gradient norm
-        if args.grad_clip > 0.0:
-            torch.nn.utils.clip_grad_norm_(model_to_opt.parameters(), args.grad_clip)
+                loss_accum = sum(l.detach().item() for l in losses) / args.grad_accum_steps if losses else 0.0
+            else:
+                for micro_step in range(args.grad_accum_steps):
+                    x, y = get_batch("train")
 
-        # Optimization step
-        optimizer.step()
-        
-        # Calculate time & hardware saturation metrics (MFU)
-        t1 = time.time()
-        dt = t1 - t0
-        t0 = t1
-        
-        # Convert DT step time to MFU using H800 peak theoretical FLOPs (312 TFLOPS bfloat16)
-        flops_per_sec = step_flops / (dt + 1e-8)
-        mfu_percentage = (flops_per_sec / (312e12)) * 100.0
-        mfu_percentage = min(100.0, max(0.0, mfu_percentage))
+                    # Disable DDP gradient sync on intermediate micro-steps
+                    if ddp:
+                        model.require_backward_grad_sync = (micro_step == args.grad_accum_steps - 1)
 
-        if master_process:
-            telemetry_str = monitor.get_formatted_telemetry()
-            logger.info(
-                f"Step {step+1}/{args.max_steps} | "
-                f"Loss: {loss_accum:.4f} | "
-                f"LR: {lr:.2e} | "
-                f"Time: {dt*1000:.1f}ms | "
-                f"MFU: {mfu_percentage:.1f}% | "
-                f"{telemetry_str}"
-            )
-            
-            # Print detailed ASCII telemetry cockpit every 50 steps
-            if (step + 1) % 50 == 0:
-                monitor.print_dashboard()
-            
-            # Write structured JSON to stdout so FastAPI server captures step metrics
-            print(f"METRICS_JSON: {{\"step\": {step+1}, \"loss\": {loss_accum:.4f}, \"lr\": {lr:.2e}, \"mfu\": {mfu_percentage:.1f}}}", flush=True)
-            
-            # Save system telemetry to outputs directory
-            import json
-            os.makedirs("outputs", exist_ok=True)
-            with open("outputs/system_telemetry.json", "w") as f:
-                json.dump(monitor.get_telemetry_report(), f, indent=2)
+                    # Forward pass under native bfloat16 AMP
+                    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                        logits, loss, _ = model(x, targets=y)
+                        loss = loss / args.grad_accum_steps
 
-            # Non-blocking asynchronous checkpoint and manifest update every 50 steps
-            if (step + 1) % 50 == 0:
-                saver.save_checkpoint(
-                    model=model,
-                    optimizer=optimizer,
-                    lr_scheduler=None,
-                    config=config,
-                    step=step + 1,
-                    epoch=0,
-                    loss=loss_accum,
-                    out_dir=args.out_dir
+                    loss_accum += loss.detach().item()
+
+                    # Backward pass
+                    loss.backward()
+
+            # Clip global gradient norm
+            if args.grad_clip > 0.0:
+                torch.nn.utils.clip_grad_norm_(model_to_opt.parameters(), args.grad_clip)
+
+            # Optimization step
+            optimizer.step()
+
+            # Calculate time & hardware saturation metrics (MFU)
+            t1 = time.time()
+            dt = t1 - t0
+            t0 = t1
+
+            # Convert DT step time to MFU using H800 peak theoretical FLOPs (312 TFLOPS bfloat16)
+            flops_per_sec = step_flops / (dt + 1e-8)
+            mfu_percentage = (flops_per_sec / (312e12)) * 100.0
+            mfu_percentage = min(100.0, max(0.0, mfu_percentage))
+
+            if master_process:
+                tracker.log({
+                    "pretrain/loss": loss_accum,
+                    "pretrain/lr": lr,
+                    "pretrain/mfu": mfu_percentage,
+                    "pretrain/step_time_ms": dt * 1000,
+                }, step=step)
+                telemetry_str = monitor.get_formatted_telemetry()
+                logger.info(
+                    f"Step {step+1}/{args.max_steps} | "
+                    f"Loss: {loss_accum:.4f} | "
+                    f"LR: {lr:.2e} | "
+                    f"Time: {dt*1000:.1f}ms | "
+                    f"MFU: {mfu_percentage:.1f}% | "
+                    f"{telemetry_str}"
                 )
 
-        step += 1
+                # Print detailed ASCII telemetry cockpit every 50 steps
+                if (step + 1) % 50 == 0:
+                    monitor.print_dashboard()
 
-    # 8. Save final pre-trained state dictionary
-    if master_process:
-        checkpoint_path = os.path.join(args.out_dir, "checkpoint_pretrain.pt")
-        logger.info(f"💾 Saving final pre-trained checkpoint to: {checkpoint_path}")
-        torch.save(
-            {
-                "model_state_dict": raw_model.state_dict(),
-                "config": config,
-                "step": step
-            },
-            checkpoint_path
-        )
-        logger.info("✅ Pre-training stage successfully completed!")
+                # Write structured JSON to stdout so FastAPI server captures step metrics
+                print(f"METRICS_JSON: {{\"step\": {step+1}, \"loss\": {loss_accum:.4f}, \"lr\": {lr:.2e}, \"mfu\": {mfu_percentage:.1f}}}", flush=True)
 
-    if ddp:
-        dist.destroy_process_group()
+                # Save system telemetry to outputs directory
+                import json
+                os.makedirs("outputs", exist_ok=True)
+                with open("outputs/system_telemetry.json", "w") as f:
+                    json.dump(monitor.get_telemetry_report(), f, indent=2)
 
+                # Non-blocking asynchronous checkpoint and manifest update every 50 steps
+                if (step + 1) % 50 == 0:
+                    saver.save_checkpoint(
+                        model=model,
+                        optimizer=optimizer,
+                        lr_scheduler=None,
+                        config=config,
+                        step=step + 1,
+                        epoch=0,
+                        loss=loss_accum,
+                        out_dir=args.out_dir
+                    )
+
+            step += 1
+
+        # 8. Save final pre-trained state dictionary
+        if master_process:
+            checkpoint_path = os.path.join(args.out_dir, "checkpoint_pretrain.pt")
+            logger.info(f"💾 Saving final pre-trained checkpoint to: {checkpoint_path}")
+            torch.save(
+                {
+                    "model_state_dict": raw_model.state_dict(),
+                    "config": config,
+                    "step": step
+                },
+                checkpoint_path
+            )
+            logger.info("✅ Pre-training stage successfully completed!")
+
+    finally:
+        if master_process:
+            tracker.finish()
+        if ddp:
+            try:
+                dist.destroy_process_group()
+            except AssertionError:
+                pass
 if __name__ == "__main__":
     main()

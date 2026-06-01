@@ -17,20 +17,19 @@ class HubAdapter:
     Provides unified interfaces for downloading datasets, tokenizers, and model weights.
     """
     def __init__(self, provider: str = None):
-        # Determine provider: command-line > environment variable > default ('hf')
-        env_provider = os.environ.get("NANO_HUB_PROVIDER", "hf").lower()
+        # Determine provider: command-line > environment variable > default ('ms')
+        env_provider = os.environ.get("NANO_HUB_PROVIDER", "ms").lower()
         self.provider = (provider or env_provider).lower()
         
         if self.provider not in ["hf", "ms"]:
-            logger.warning(f"Unsupported provider '{self.provider}'. Falling back to 'hf'.")
-            self.provider = "hf"
+            logger.warning(f"Unsupported provider '{self.provider}'. Falling back to 'ms'.")
+            self.provider = "ms"
             
         # Proactively configure mainland China high-speed mirrors for Hugging Face
-        if self.provider == "hf":
-            # If no endpoint is configured, suggest or default to the official hf-mirror.com
-            if "HF_ENDPOINT" not in os.environ:
-                logger.info("Setting HF_ENDPOINT mirror to https://hf-mirror.com for high-speed downloads...")
-                os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+        # Always set HF_ENDPOINT if it is not present, to ensure high speed fallback
+        if "HF_ENDPOINT" not in os.environ:
+            logger.info("Setting HF_ENDPOINT mirror to https://hf-mirror.com for high-speed downloads...")
+            os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
                 
         logger.info(f"Initialized HubAdapter targeting provider: {self.provider.upper()}")
 
@@ -48,15 +47,13 @@ class HubAdapter:
                 dataset = MsDataset.load(dataset_id, split=split, **kwargs)
                 logger.info(f"✅ Successfully loaded dataset '{dataset_id}' from ModelScope.")
                 return dataset
-            except ImportError:
-                logger.error("The 'modelscope' library is required to load datasets from ModelScope.")
-                logger.info("Please install via: pip install modelscope")
-                raise
             except Exception as e:
-                logger.error(f"Failed to load from ModelScope: {e}. Attempting Hugging Face fallback...")
+                logger.warning(f"Failed to load dataset '{dataset_id}' from ModelScope: {e}. Attempting Hugging Face fallback...")
                 
-        # Hugging Face default path
+        # Hugging Face default path (with mirror enabled)
         try:
+            if "HF_ENDPOINT" not in os.environ:
+                os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
             from datasets import load_dataset
             dataset = load_dataset(dataset_id, split=split, **kwargs)
             logger.info(f"✅ Successfully loaded dataset '{dataset_id}' from Hugging Face.")
@@ -87,15 +84,13 @@ class HubAdapter:
                     return MSAutoTokenizer.from_pretrained(local_dir, **kwargs)
                 else:
                     return MSAutoModel.from_pretrained(local_dir, **kwargs)
-            except ImportError:
-                logger.error("The 'modelscope' library is required to load models from ModelScope.")
-                logger.info("Please install via: pip install modelscope")
-                raise
             except Exception as e:
-                logger.error(f"ModelScope snapshot load failed: {e}. Falling back to Hugging Face...")
+                logger.warning(f"ModelScope {load_type} snapshot load failed for '{repo_id}': {e}. Falling back to Hugging Face...")
 
         # Hugging Face default path (utilizes HF_ENDPOINT mirror seamlessly)
         try:
+            if "HF_ENDPOINT" not in os.environ:
+                os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
             from transformers import AutoTokenizer, AutoModelForCausalLM
             if load_type == "tokenizer":
                 tokenizer = AutoTokenizer.from_pretrained(repo_id, **kwargs)
@@ -106,7 +101,7 @@ class HubAdapter:
                 logger.info(f"✅ Model '{repo_id}' loaded from Hugging Face.")
                 return model
         except ImportError:
-            logger.error("The 'transformers' library is required for Hugging Face model loading.")
+            logger.error(f"The 'transformers' library is required for Hugging Face {load_type} loading.")
             logger.info("Please install via: pip install transformers")
             raise
 

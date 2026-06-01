@@ -5,6 +5,7 @@ import argparse
 import logging
 import torch
 import torch.nn.functional as F
+from transformers import AutoTokenizer
 from model import Transformer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -93,7 +94,7 @@ def evaluate_mmlu(model: Transformer, tokenizer, device: str = "cuda") -> float:
         x = torch.tensor([input_ids], dtype=torch.long, device=device)
         
         # Forward pass: get logits of the last token
-        logits, _ = model(x)
+        logits, _, _ = model(x)
         last_token_logits = logits[0, -1, :] # Shape: (vocab_size)
         
         # Extract logits corresponding only to tokens A, B, C, D
@@ -137,7 +138,7 @@ def evaluate_gsm8k(model: Transformer, tokenizer, device: str = "cuda") -> float
         # Generate completion autoregressively (max 256 tokens)
         generated_ids = list(input_ids)
         for _ in range(256):
-            logits, _ = model(torch.tensor([generated_ids], dtype=torch.long, device=device))
+            logits, _, _ = model(torch.tensor([generated_ids], dtype=torch.long, device=device))
             last_logits = logits[0, -1, :]
             next_token = torch.argmax(last_logits).item()
             generated_ids.append(next_token)
@@ -188,7 +189,7 @@ def generate_completion_for_arena(model: Transformer, tokenizer, prompt: str, de
     generated_ids = list(input_ids)
     
     for _ in range(128):
-        logits, _ = model(torch.tensor([generated_ids], dtype=torch.long, device=device))
+        logits, _, _ = model(torch.tensor([generated_ids], dtype=torch.long, device=device))
         last_logits = logits[0, -1, :]
         next_token = torch.argmax(last_logits).item()
         generated_ids.append(next_token)
@@ -368,7 +369,7 @@ class NeedleInAHaystackEvaluator:
                 generated_ids = list(input_ids)
                 for _ in range(64):
                     active_x = torch.tensor([generated_ids[-model.config.block_size:]], dtype=torch.long, device=device)
-                    logits, _ = model(active_x)
+                    logits, _, _ = model(active_x)
                     next_tok = torch.argmax(logits[0, -1, :]).item()
                     generated_ids.append(next_tok)
                     if next_tok in [tokenizer.eos_token_id, tokenizer.encode("<|im_end|>", add_special_tokens=False)[0]]:
@@ -396,6 +397,43 @@ class NeedleInAHaystackEvaluator:
                 
         return results
 
+@torch.no_grad()
+def evaluate_perplexity(model: Transformer, val_bin_path: str = "./data/binaries/val.bin", block_size: int = 1024, num_batches: int = 100, device: str = "cuda") -> float:
+    """
+    Computes the exact mathematical Perplexity (PPL) of the pre-trained base model
+    on the held-out validation token binary dataset.
+    """
+    logger.info(f"--- Running Intrinsic Perplexity (PPL) Evaluation on {val_bin_path} ---")
+    if not os.path.exists(val_bin_path):
+        logger.warning(f"Validation binary not found at {val_bin_path} — skipping PPL.")
+        return float('inf')
+        
+    try:
+        import numpy as np
+        import math
+        val_data = np.memmap(val_bin_path, dtype=np.uint16, mode="r")
+        total_loss = 0.0
+        count = 0
+        
+        # Run deterministic batched loss evaluation over validation corpus
+        for i in range(num_batches):
+            start_idx = (i * block_size) % (len(val_data) - block_size - 1)
+            x = torch.from_numpy(val_data[start_idx : start_idx + block_size].astype(np.int64)).unsqueeze(0).to(device)
+            y = torch.from_numpy(val_data[start_idx + 1 : start_idx + 1 + block_size].astype(np.int64)).unsqueeze(0).to(device)
+            
+            logits, loss, _ = model(x, targets=y)
+            total_loss += loss.item()
+            count += 1
+            
+        avg_loss = total_loss / count
+        perplexity = math.exp(avg_loss)
+        logger.info(f"🏆 Held-out Validation Loss: {avg_loss:.4f} | Validation Perplexity (PPL): {perplexity:.4f}")
+        return perplexity
+    except Exception as e:
+        logger.error(f"Failed to calculate perplexity: {e}")
+        return float('inf')
+
+
 # ==============================================================================
 # Main Orchestrated Runner
 # ==============================================================================
@@ -409,32 +447,22 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     logger.info(f"Loading checkpoint state from: {args.checkpoint_path}")
-    checkpoint = torch.load(args.checkpoint_path, map_location=device, weights_only=False)
-    model_config = checkpoint["config"]
+    from utils.checkpoint_utils import load_checkpoint_with_fp8_translation
+    model_config, state_dict = load_checkpoint_with_fp8_translation(args.checkpoint_path, map_location=device)
     
     # Instantiate Model
-    state_dict = checkpoint.get("model_state_dict", checkpoint.get("model"))
     model = Transformer(model_config).to(device)
     model.load_state_dict(state_dict)
     model.eval()
     
     # Load tokenizer
     logger.info("Initializing tokenizer...")
-    from serve import CustomTokenizerAdapter
-    if os.path.exists("./data/custom_tokenizer.json"):
-        logger.info("Found custom trained BPE tokenizer. Loading from ./data/custom_tokenizer.json...")
-        from train_tokenizer import CustomBPETokenizer
-        raw_tok = CustomBPETokenizer()
-        raw_tok.load("./data/custom_tokenizer.json")
-        tokenizer = CustomTokenizerAdapter(raw_tok)
-    else:
-        logger.warning("Custom tokenizer not found. Falling back to AutoTokenizer...")
-        from utils.hub_adapter import HubAdapter
-        hub = HubAdapter()
-        tokenizer = hub.load_tokenizer_or_model("Qwen/Qwen2.5-7B" if hub.provider == "hf" else "qwen/Qwen2.5-7B", load_type="tokenizer")
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id or 0
+    from utils.tokenizer_loader import load_tokenizer
+    tokenizer = load_tokenizer()
         
+    # 0. Run Validation Perplexity (PPL) Intrinsic Evaluation
+    val_ppl = evaluate_perplexity(model, val_bin_path="./data/binaries/val.bin", block_size=model_config.block_size, device=device)
+
     # 1. Run MMLU
     mmlu_acc = evaluate_mmlu(model, tokenizer, device=device)
     
@@ -445,9 +473,8 @@ def main():
     # If no baseline is provided, we clone the model configuration to run self-arena representing standard decoding baseline
     if args.baseline_checkpoint_path and os.path.exists(args.baseline_checkpoint_path):
         logger.info(f"Loading baseline checkpoint state from: {args.baseline_checkpoint_path}")
-        base_checkpoint = torch.load(args.baseline_checkpoint_path, map_location=device, weights_only=False)
-        base_state = base_checkpoint.get("model_state_dict", base_checkpoint.get("model"))
-        baseline_model = Transformer(base_checkpoint["config"]).to(device)
+        base_config, base_state = load_checkpoint_with_fp8_translation(args.baseline_checkpoint_path, map_location=device)
+        baseline_model = Transformer(base_config).to(device)
         baseline_model.load_state_dict(base_state)
         baseline_model.eval()
     else:
@@ -461,6 +488,7 @@ def main():
     logger.info("=======================================================================")
     logger.info("📊 Benchmark Leaderboard & Arena Report:")
     logger.info("-----------------------------------------------------------------------")
+    logger.info(f"🏆 Held-out Validation Perplexity (PPL): {val_ppl:.4f}")
     logger.info(f"🏆 MMLU Multiple Choice Accuracy: {mmlu_acc*100:.2f}%")
     logger.info(f"🏆 GSM8K Grade School Math Accuracy: {gsm_acc*100:.2f}%")
     logger.info(f"🏆 Consolidated Leaderboard Index: {((mmlu_acc + gsm_acc)/2)*100:.2f}%")
@@ -476,6 +504,7 @@ def main():
     # Save a JSON metric file for our Web Dashboard to read!
     import json
     report = {
+        "validation_perplexity": val_ppl,
         "mmlu_accuracy": mmlu_acc,
         "gsm8k_accuracy": gsm_acc,
         "consolidated_score": (mmlu_acc + gsm_acc) / 2,
