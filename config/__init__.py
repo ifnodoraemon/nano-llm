@@ -216,6 +216,22 @@ MODEL_PRESETS: dict[str, ModelPreset] = {
         num_routed_experts=8,
         num_active_experts=2,
     ),
+    "1.5B-dense": ModelPreset(
+        name="1.5B-dense",
+        n_layer=24,
+        n_head=32,
+        n_embd=2048,
+        block_size=4096,
+        vocab_size=32000,
+    ),
+    "2.7B-dense": ModelPreset(
+        name="2.7B-dense",
+        n_layer=32,
+        n_head=32,
+        n_embd=2560,
+        block_size=4096,
+        vocab_size=32000,
+    ),
 }
 
 
@@ -284,14 +300,14 @@ def load_config(
 
     Args:
         mode: "dev" for fast iteration, "prod" for full-scale training.
-        model_size: Key from MODEL_PRESETS (default: "tiny" for dev, "16B-equivalent" for prod).
+        model_size: Key from MODEL_PRESETS (default: "tiny" for dev, "1.5B-dense" for prod).
         num_gpus: Override detected GPU count.
         **overrides: Any TrainingConfig field can be overridden.
     """
     hw = detect_hardware()
 
     if model_size is None:
-        model_size = "tiny" if mode == "dev" else "16B-equivalent"
+        model_size = "tiny" if mode == "dev" else "1.5B-dense"
 
     if model_size not in MODEL_PRESETS:
         raise ValueError(f"Unknown model size '{model_size}'. Available: {list(MODEL_PRESETS.keys())}")
