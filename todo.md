@@ -32,7 +32,7 @@
     *   *设计*：在反向传播前，根据当前 batch 的 loss 偏离 EMA (指数移动平均) 历史 loss 的绝对偏差 $\delta = |\text{Loss} - \text{EMA\_Loss}|$，动态计算动态重缩放因子：
         *   若 $\delta > 3\sigma$（偏离过高，判定为二进制噪声或系统日志等脏数据），对该 Batch 的梯度乘 0.1 衰减权重，防止参数学坏；
         *   若 Loss 接近于 0 且 $\delta \approx 0$（判定为版权免责声明等高度冗余数据），进行轻微惩罚。
-    *   *目的*：from 算法底层提供预训练稳定性护栏，彻底摆脱对繁琐 Adam 超参数的经验调参依赖。
+    *   *目的*：从算法底层提供预训练稳定性护栏，彻底摆脱对繁琐 Adam 超参数的经验调参依赖。
 *   **4) Spectral Decoupled RoPE Base Scaling (谱分离位置编码基频预外推)**：
     *   *设计*：不同于 YaRN 等对称插值，在预训练阶段应用谱分离位置编码：
         *   对高频维度部分（代表短程局部注意力）保持基频 $\theta=10000$ 绝对不缩放，确保 1K 范围内的近距离高精度逻辑和结构感知；
@@ -115,7 +115,7 @@
 
 ### 3.6 补齐多模态 (VLM) 视觉对齐全链路训练入口 (Unlock Multimodal Alignment Entry) (P2)
 *   **问题**：虽然 `data.py` 实现了 `MultimodalSFTDataset`，且模型底座包含了 `vision_projection`。但在 SFT、DPO 和 GRPO 的训练脚本中完全缺失多模态数据的调用开关，导致模型无法实际参与视觉对齐训练。
-*   **待办**：在 `train.py` / `align.py` 等脚本中补齐 `--use_multimodal` 开关，动态替换为多模态 Dataset 与 Collator，并将提取 of `pixel_values` 传入模型 forward 接口。
+*   **待办**：在 `train.py` / `align.py` 等脚本中补齐 `--use_multimodal` 开关，动态替换为多模态 Dataset 与 Collator，并将提取的 `pixel_values` 传入模型 forward 接口。
 
 ---
 
@@ -173,11 +173,12 @@
     *   **Dynamic Tiling Strategy (动态图块切片)**：输入图像首先进行等比缩放。对于高分辨率大图，自适应切割为多个 $384 \times 384$ 的局部 Tiles，同时生成一张全局 Thumbnail 缩略图 Tile，共同输入同一 Vision Encoder，以保留全局上下文和局部的极细微细节。
     *   **Global-Local Hybrid Attention (全局-局部混合注意力)**：将局部的 tiles 语义向量和全局缩略图向量以并联形式映射为 visual tokens，在 LLM 侧建立针对不同 tiles 区域的空间路由机制，实现对长 PDF 和复杂图表的无损精确 OCR 与语义问答。
 
-### 5.7 💡 对标 DeepSeek 2026《Thinking with Visual Primitives》：基于视觉基元的 CoT 推理与极速 Token 压缩 (P2)
-*   **问题**：传统多模态模型存在“指代鸿沟（Reference Gap）”，在密集目标计数（Pixmo-Count）、迷宫导航（DS_Maze_Navigation）和路径追踪上极易发生空间定位错乱；且 1M 大文本读图时 KV Cache 仍然膨胀。
+### 5.7 💡 对标 DeepSeek 2026《Thinking with Visual Primitives》：基于空间标记思考 (Thinking with Points & Bounding Boxes) (P2)
+*   **背景 (指代鸿沟)**：DeepSeek 最新多模态研究提出，模型常面临“指代鸿沟（Reference Gap）”。语言无法精准描述连续空间，导致密集计数（Pixmo-Count）、迷宫导航（DS_Maze_Navigation）和路径追踪（DS_Path_Tracing）在纯语言 CoT 时完全崩溃。
 *   **设计**：
-    *   **Thinking with Visual Primitives (基于视觉基元的思维推理)**：对多模态模型引入基于物理点（points）与边界框（bounding boxes）的显式视觉基元表征。训练模型在 `<think>` 中不仅做文字推理，而且输出精确定位坐标，使语言词与像素坐标强对齐。并在 GRPO 的 Rule 奖励函数中增加针对视觉基元坐标精度的规则判定。
-    *   **36倍强力 Token 级压缩**：结合 DeepSeek V4 实践，将 $756 \times 756$ 产生的 2,916 个 ViT 原始 token，先在 Projector 侧压缩至 324 个；输入到 V4 架构后，利用 Compressed Sparse Attention (CSA) 执行二次低秩 KV 压缩，最终仅占用 **81** 个 KV cache 词目，显存占用降低为 1/36。
+    *   **Thinking with Visual Primitives (基于空间标记思考)**：将空间标记 —— 代表位置的 **Point (点)** 与代表范围的 **Bounding Box (边界框)** 提升为“思考的最小单元”。训练模型在 `<think>` 思考链中交替输出点 `&lt;｜point｜&gt;[[y, x]]&lt;｜/point｜&gt;` 和框 `&lt;｜box｜&gt;[[y1, x1, y2, x2]]&lt;｜/box｜&gt;`，把语言逻辑死死锚定在物理像素坐标上。
+    *   **训练流水线与 RL 引导**：先在 Web 抓取的 bbox 框数据集上进行专家 SFT（因为框的标注是确定性的，信息丰满，更易学习），随后在后训练阶段通过强化学习（RL）引导模型学习 point。对迷宫导航等设计细粒度的 RL 奖励（路径覆盖度、回溯探索完整度、避障墙壁判定率），以形成自愈寻路闭环。
+    *   **7056倍像素超强压缩 (极致 token 效率)**：在 Vision Encoder 出口执行 3×3 空间降采样（每 9 个 patch 合成 1 个），送入 LLM 前再次利用 CSA (压缩稀疏注意力) 将 KV cache 压缩 4 倍，将 756×756 图像最终压缩至 **81 个 KV 条目**，以 1/8 的 token 占用跑赢 GPT-5.4 与 Claude 4.6 级别的长上下文视觉推理。
 
 ---
 
