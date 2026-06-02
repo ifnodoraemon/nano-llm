@@ -28,6 +28,72 @@ from grpo.engine import generate_completions, compute_action_logprobs
 
 logger = logging.getLogger(__name__)
 
+
+@torch.no_grad()
+def run_online_evaluation(model, dataloader, tokenizer, device, max_gen_len, num_prompts=20):
+    model.eval()
+    total_len = 0
+    correct_count = 0
+    compiled_count = 0
+    total_count = 0
+    
+    for batch in dataloader:
+        if total_count >= num_prompts:
+            break
+            
+        prompt_texts = batch["prompt_texts"]
+        prompt_ids = batch["prompt_ids"].to(device)
+        ground_truths = batch["ground_truths"]
+        pixel_values = batch["pixel_values"]
+        
+        for idx in range(len(prompt_texts)):
+            if total_count >= num_prompts:
+                break
+                
+            p_ids = prompt_ids[idx].unsqueeze(0)
+            p_text = prompt_texts[idx]
+            gt = ground_truths[idx]
+            p_val = pixel_values[idx].unsqueeze(0).to(device) if pixel_values is not None else None
+            
+            # Generate completion
+            completions, _ = generate_completions(
+                model=model,
+                prompt_ids=p_ids,
+                pixel_values=p_val,
+                max_gen_len=max_gen_len,
+                temperature=0.0,  # Greedy generation
+                tokenizer=tokenizer
+            )
+            
+            gen_tokens = completions[0, p_ids.shape[1]:]
+            gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+            
+            total_len += len(gen_tokens)
+            
+            rewards = evaluate_completion_rewards([p_text], [gen_text], [gt])
+            if rewards[0].item() > 0.5:
+                correct_count += 1
+                
+            if "```python" in gen_text:
+                try:
+                    code_block = gen_text.split("```python")[1].split("```")[0]
+                    compile(code_block, "<string>", "exec")
+                    compiled_count += 1
+                except Exception:
+                    pass
+            else:
+                compiled_count += 1
+                
+            total_count += 1
+            
+    avg_len = total_len / max(1, total_count)
+    accuracy = correct_count / max(1, total_count)
+    compile_rate = compiled_count / max(1, total_count)
+    
+    model.train()
+    return avg_len, accuracy, compile_rate
+
+
 # ==============================================================================
 # 5. Distributed GRPO Engine Loop
 # ==============================================================================
@@ -122,13 +188,29 @@ def train():
     dataset = GRPODataset(args.data_path, tokenizer, max_prompt_length=args.max_prompt_len)
     validate_dataset(dataset, tokenizer=tokenizer, name="GRPO training dataset")
 
-    sampler = DistributedSampler(dataset, shuffle=True) if use_ddp else None
+    # Split dataset into train and validation (90% train, 10% val)
+    val_size = int(0.1 * len(dataset))
+    train_size = len(dataset) - val_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42)
+    )
+
+    sampler = DistributedSampler(train_dataset, shuffle=True) if use_ddp else None
     loader = DataLoader(
-        dataset, 
+        train_dataset, 
         batch_size=args.batch_size, 
         sampler=sampler, 
         collate_fn=lambda b: grpo_collate_fn(b, pad_token_id=tokenizer.pad_token_id), 
         shuffle=(sampler is None)
+    )
+    
+    val_sampler = DistributedSampler(val_dataset, shuffle=False) if use_ddp else None
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        sampler=val_sampler,
+        collate_fn=lambda b: grpo_collate_fn(b, pad_token_id=tokenizer.pad_token_id),
+        shuffle=False
     )
     assert_grad_accum_safe(loader, args.grad_accum_steps, args.batch_size)
 
@@ -222,14 +304,22 @@ def train():
                     rewards = rewards.to(device)
                     total_reward += rewards.mean().item()
 
-                    # 3. Advantage calculation (Normalizing rewards using GRPORewardScaler)
-                    scaled_rewards = reward_scaler.update_and_scale(rewards)
-                    r_mean = scaled_rewards.mean()
-                    r_std = scaled_rewards.std()
+                    # 3. Advantage calculation (Group-relative advantage computation)
+                    r_mean = rewards.mean()
+                    
+                    if use_ddp:
+                        # Gather rewards from all ranks to compute global standard deviation
+                        gathered_rewards = [torch.zeros_like(rewards) for _ in range(dist.get_world_size())]
+                        dist.all_gather(gathered_rewards, rewards)
+                        all_rewards = torch.cat(gathered_rewards)
+                        r_std = all_rewards.std()
+                    else:
+                        r_std = rewards.std()
+                        
                     # If std is zero (all samples scored same), set std to 1.0 to avoid NaNs
                     if r_std < 1e-6:
                         r_std = 1.0
-                    advantages = (scaled_rewards - r_mean) / (r_std + 1e-8)
+                    advantages = (rewards - r_mean) / (r_std + 1e-8)
 
                     # 4. Compute Log Probabilities under Old/Reference Model & Current Policy Model
                     # In GRPO, we sample using policy_model and compute active forward logits
@@ -295,9 +385,29 @@ def train():
                             f"{telemetry_str}"
                         )
 
-                        # Print detailed ASCII telemetry cockpit every 50 steps
+                        # Print detailed ASCII telemetry cockpit and run online evaluation every 50 steps
                         if (step_idx + 1) % 50 == 0:
                             monitor.print_dashboard()
+                            
+                            avg_len, accuracy, compile_rate = run_online_evaluation(
+                                model=policy_model.module if use_ddp else policy_model,
+                                dataloader=val_loader,
+                                tokenizer=tokenizer,
+                                device=device,
+                                max_gen_len=args.max_gen_len,
+                                num_prompts=20
+                            )
+                            tracker.log({
+                                "eval/avg_len": avg_len,
+                                "eval/accuracy": accuracy,
+                                "eval/compile_rate": compile_rate,
+                            }, step=step_idx)
+                            logger.info(
+                                f"🛡️  [Online Eval] Step {step_idx + 1} | "
+                                f"Avg Gen Len: {avg_len:.1f} | "
+                                f"Accuracy: {accuracy:.2%} | "
+                                f"Sandbox Compile Rate: {compile_rate:.2%}"
+                            )
 
                         # Save system telemetry to outputs directory
                         import json

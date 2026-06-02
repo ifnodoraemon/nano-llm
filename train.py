@@ -22,6 +22,60 @@ from utils.training_utils import validate_dataset, assert_grad_accum_safe, get_c
 logger = logging.getLogger(__name__)
 
 
+def construct_block_diagonal_mask(seqlens_list, max_length, device):
+    """
+    Constructs a 2D block-diagonal causal attention mask of shape [B, 1, max_length, max_length].
+    seqlens_list is a list of lists, where each inner list contains segment lengths for that batch item.
+    """
+    batch_size = len(seqlens_list)
+    mask = torch.full((batch_size, 1, max_length, max_length), float("-inf"), device=device)
+    
+    for b, seqlens in enumerate(seqlens_list):
+        start_idx = 0
+        for seq_len in seqlens:
+            end_idx = start_idx + seq_len
+            if seq_len > 0:
+                block_mask = torch.triu(torch.full((seq_len, seq_len), float("-inf"), device=device), diagonal=1)
+                mask[b, 0, start_idx:end_idx, start_idx:end_idx] = block_mask
+            start_idx = end_idx
+            
+    return mask
+
+
+@torch.no_grad()
+def evaluate_val_loss(model, dataloader, device, ddp, max_length):
+    model.eval()
+    total_loss = 0.0
+    count = 0
+    for batch in dataloader:
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        labels = batch["labels"].to(device, non_blocking=True)
+        
+        mask = None
+        if "seqlens" in batch:
+            mask = construct_block_diagonal_mask(batch["seqlens"], max_length, device)
+            
+        dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+        with torch.amp.autocast("cuda", dtype=dtype, enabled=torch.cuda.is_available()):
+            _, loss, _ = model(input_ids, targets=labels, mask=mask)
+        total_loss += loss.item()
+        count += 1
+    
+    if count == 0:
+        return 0.0
+    
+    # Average across GPUs if DDP is active
+    if ddp:
+        loss_tensor = torch.tensor(total_loss / count, device=device)
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+        avg_loss = loss_tensor.item() / dist.get_world_size()
+    else:
+        avg_loss = total_loss / count
+    
+    model.train()
+    return avg_loss
+
+
 # ==============================================================================
 # Main Orchestrated SFT DDP Training Script
 # ==============================================================================
@@ -87,12 +141,29 @@ def train():
     
     collator = SequencePackingCollator(pad_token_id=tokenizer.pad_token_id, max_length=args.max_length)
 
-    sampler = DistributedSampler(dataset, num_replicas=ddp_world_size, rank=ddp_rank, shuffle=True) if ddp else None
+    # Split dataset into train and validation sets (90% train, 10% val)
+    val_size = int(0.1 * len(dataset))
+    train_size = len(dataset) - val_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size], generator=torch.Generator().manual_seed(args.seed)
+    )
+
+    train_sampler = DistributedSampler(train_dataset, num_replicas=ddp_world_size, rank=ddp_rank, shuffle=True) if ddp else None
+    val_sampler = DistributedSampler(val_dataset, num_replicas=ddp_world_size, rank=ddp_rank, shuffle=False) if ddp else None
+
     dataloader = DataLoader(
-        dataset, 
+        train_dataset, 
         batch_size=args.batch_size, 
-        sampler=sampler, 
-        shuffle=(sampler is None),
+        sampler=train_sampler, 
+        shuffle=(train_sampler is None),
+        collate_fn=collator,
+        pin_memory=True
+    )
+    val_dataloader = DataLoader(
+        val_dataset, 
+        batch_size=args.batch_size, 
+        sampler=val_sampler, 
+        shuffle=False,
         collate_fn=collator,
         pin_memory=True
     )
@@ -100,7 +171,10 @@ def train():
 
     # 3. Load Modern LLaMA Model with custom LoRA configurations
     logger.info("Assembling custom LLaMA Transformer architecture...")
-    base_checkpoint_path = "./outputs/checkpoint_pretrain.pt"
+    base_checkpoint_path = args.model_name_or_path
+    if not os.path.exists(base_checkpoint_path) and os.path.exists("./outputs/checkpoint_pretrain.pt"):
+        base_checkpoint_path = "./outputs/checkpoint_pretrain.pt"
+    
     restored_step = 0
     has_ckpt = False
     if os.path.exists(base_checkpoint_path):
@@ -185,8 +259,12 @@ def train():
                 labels = batch["labels"].to(device, non_blocking=True)
 
                 dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+                mask = None
+                if "seqlens" in batch:
+                    mask = construct_block_diagonal_mask(batch["seqlens"], args.max_length, device)
+
                 with torch.amp.autocast("cuda", dtype=dtype, enabled=torch.cuda.is_available()):
-                    logits, loss, _ = model(input_ids, targets=labels)
+                    logits, loss, _ = model(input_ids, targets=labels, mask=mask)
                     loss = loss / args.grad_accum_steps
 
                 epoch_loss += loss.item() * args.grad_accum_steps
@@ -225,6 +303,13 @@ def train():
 
                     optimizer.zero_grad(set_to_none=True)
                     step_counter += 1
+
+                    # Periodic Validation Loop
+                    if step_counter % 100 == 0:
+                        val_loss = evaluate_val_loss(model, val_dataloader, device, ddp, args.max_length)
+                        if is_master:
+                            tracker.log({"sft/val_loss": val_loss}, step=step_counter)
+                            logger.info(f"🏆 Step {step_counter} | Validation Loss: {val_loss:.4f}")
 
                     # Rank 0 Master logging with MFU (Model FLOPs Utilization) tracking!
                     if is_master and step_counter % 10 == 0:
@@ -267,8 +352,10 @@ def train():
                         }, checkpoint_path)
 
             avg_epoch_loss = epoch_loss / len(dataloader)
+            val_loss = evaluate_val_loss(model, val_dataloader, device, ddp, args.max_length)
             if is_master:
-                logger.info(f"--- Epoch {epoch+1} completed! Average Loss: {avg_epoch_loss:.4f} ---")
+                logger.info(f"--- Epoch {epoch+1} completed! Average Loss: {avg_epoch_loss:.4f} | Validation Loss: {val_loss:.4f} ---")
+                tracker.log({"sft/epoch_val_loss": val_loss}, step=step_counter)
 
         # Save final model state
         if is_master:

@@ -104,10 +104,12 @@ class SequencePackingCollator:
         batch_input_ids = []
         batch_labels = []
         batch_position_ids = []
+        batch_seqlens = []
         
         curr_input_ids = []
         curr_labels = []
         curr_position_ids = []
+        curr_seqlens = []
         
         for sample in samples:
             ids = sample["input_ids"].tolist()
@@ -127,19 +129,23 @@ class SequencePackingCollator:
                     curr_input_ids.extend([self.pad_token_id] * padding_len)
                     curr_labels.extend([-100] * padding_len)
                     curr_position_ids.extend([0] * padding_len)
+                    curr_seqlens.append(padding_len)
                     
                 batch_input_ids.append(torch.tensor(curr_input_ids, dtype=torch.long))
                 batch_labels.append(torch.tensor(curr_labels, dtype=torch.long))
                 batch_position_ids.append(torch.tensor(curr_position_ids, dtype=torch.long))
+                batch_seqlens.append(curr_seqlens)
                 
                 # Reset buffers
                 curr_input_ids = []
                 curr_labels = []
                 curr_position_ids = []
+                curr_seqlens = []
                 
             curr_input_ids.extend(ids)
             curr_labels.extend(lbls)
             curr_position_ids.extend(list(range(seq_len))) # Reset positions at boundaries!
+            curr_seqlens.append(seq_len)
             
         # Append remaining buffer
         if curr_input_ids:
@@ -148,15 +154,18 @@ class SequencePackingCollator:
                 curr_input_ids.extend([self.pad_token_id] * padding_len)
                 curr_labels.extend([-100] * padding_len)
                 curr_position_ids.extend([0] * padding_len)
+                curr_seqlens.append(padding_len)
                 
             batch_input_ids.append(torch.tensor(curr_input_ids, dtype=torch.long))
             batch_labels.append(torch.tensor(curr_labels, dtype=torch.long))
             batch_position_ids.append(torch.tensor(curr_position_ids, dtype=torch.long))
+            batch_seqlens.append(curr_seqlens)
             
         return {
             "input_ids": torch.stack(batch_input_ids),
             "labels": torch.stack(batch_labels),
             "position_ids": torch.stack(batch_position_ids),
+            "seqlens": batch_seqlens,
             "attention_mask": torch.ones(len(batch_input_ids), self.max_length, dtype=torch.long)
         }
 

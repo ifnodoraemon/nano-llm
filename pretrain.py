@@ -45,6 +45,9 @@ def main():
     parser.add_argument("--data_mix", type=str, default=None,
                         choices=["balanced", "code_heavy", "zh_focused", "english_only"],
                         help="Data mixing preset for multi-domain pretraining")
+    parser.add_argument("--model_size", type=str, default=None,
+                        choices=["tiny", "1.5B-dense", "2B-dense", "2.7B-dense"],
+                        help="Model preset size configuration")
     args = parser.parse_args()
 
     # 0. Initialize hardware telemetry monitor
@@ -210,8 +213,7 @@ def main():
                 if master_process:
                     logger.info(f"Multi-domain data mixer active — preset: {args.data_mix}")
 
-    # 3. Build model Config & Model
-    cfg = load_config(mode="prod" if args.max_steps > 500 else "dev", num_gpus=ddp_world_size)
+    cfg = load_config(mode="prod" if args.max_steps > 500 else "dev", model_size=args.model_size, num_gpus=ddp_world_size)
     config = config_to_model_config(
         cfg,
         block_size=args.block_size,
@@ -295,11 +297,12 @@ def main():
     n_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
     step_flops = estimate_step_flops(
         n_parameters=n_params,
-        batch_size=args.batch_size * ddp_world_size * args.grad_accum_steps,
+        batch_size=args.batch_size,
         seq_len=args.block_size,
         n_layer=config.n_layer,
         n_embd=config.n_embd,
-        n_head=config.n_head
+        n_head=config.n_head,
+        use_activation_checkpointing=(args.use_checkpoint.lower() == "true")
     )
 
     if master_process:
@@ -370,8 +373,13 @@ def main():
             t0 = t1
 
             # Convert DT step time to MFU using H800 peak theoretical FLOPs (312 TFLOPS bfloat16)
-            flops_per_sec = step_flops / (dt + 1e-8)
-            mfu_percentage = (flops_per_sec / (312e12)) * 100.0
+            mfu_percentage = calculate_mfu(
+                step_flops=step_flops,
+                elapsed_time=dt,
+                grad_accum_steps=args.grad_accum_steps,
+                world_size=ddp_world_size,
+                peak_flops=312e12
+            )
             mfu_percentage = min(100.0, max(0.0, mfu_percentage))
 
             if master_process:

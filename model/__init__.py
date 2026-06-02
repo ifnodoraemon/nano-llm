@@ -350,6 +350,7 @@ class Transformer(nn.Module):
         start_pos: Optional[int] = None,
         kv_caches: Optional[List] = None,  # List of Tensor (MLA) or Tuple[Tensor, Tensor] (standard)
         return_all_logits: bool = False,
+        mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         _bsz, seqlen = tokens.shape
 
@@ -386,11 +387,11 @@ class Transformer(nn.Module):
             if self.training and self.config.use_checkpoint:
                 from torch.utils.checkpoint import checkpoint
                 def custom_layer_forward(hidden_states, rope_freqs):
-                    out, _ = layer(hidden_states, rope_freqs, mask=None, start_pos=start_pos, kv_cache=layer_cache)
+                    out, _ = layer(hidden_states, rope_freqs, mask=mask, start_pos=start_pos, kv_cache=layer_cache)
                     return out
                 h = checkpoint(custom_layer_forward, h, freqs_cis, use_reentrant=False)
             else:
-                h, aux_loss = layer(h, freqs_cis, mask=None, start_pos=start_pos, kv_cache=layer_cache)
+                h, aux_loss = layer(h, freqs_cis, mask=mask, start_pos=start_pos, kv_cache=layer_cache)
                 if aux_loss is not None:
                     total_aux_loss = total_aux_loss + aux_loss
 
