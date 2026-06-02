@@ -42,6 +42,7 @@ def main():
     parser.add_argument("--use_triton_mla", type=str, default="False", help="Use Triton MLA kernel")
     parser.add_argument("--use_triton", type=str, default="False", help="Use Triton RMSNorm and SwiGLU kernels")
     parser.add_argument("--use_checkpoint", type=str, default="False", help="Enable activation checkpointing to save VRAM")
+    parser.add_argument("--use_compile", type=str, default="False", help="Use torch.compile to optimize runtime performance")
     parser.add_argument("--data_mix", type=str, default=None,
                         choices=["balanced", "code_heavy", "zh_focused", "english_only"],
                         help="Data mixing preset for multi-domain pretraining")
@@ -235,6 +236,12 @@ def main():
         convert_to_fp8(model)
 
     model.to(device)
+
+    # 4b. JIT compilation optimization via torch.compile
+    if args.use_compile.lower() == "true":
+        if master_process:
+            logger.info("🔥 Enabling PyTorch Inductor compilation (torch.compile)...")
+        model = torch.compile(model)
 
     # Log trainable parameter count
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
