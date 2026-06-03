@@ -62,6 +62,9 @@ class CustomBPETokenizer:
             "<|im_end|>": 10001,
             "<|pad|>": 10002
         }
+        self.bos_token_id = 10000
+        self.eos_token_id = 10001
+        self.pad_token_id = 10002
 
     def train(self, text: str, vocab_size: int):
         """
@@ -97,7 +100,7 @@ class CustomBPETokenizer:
             
         logger.info(f"BPE training complete! Final vocabulary size: {len(self.vocab)}")
 
-    def encode(self, text: str) -> List[int]:
+    def encode(self, text: str, *args, **kwargs) -> List[int]:
         """
         Encodes a string into BPE token IDs by iteratively applying merges in learn-order.
         """
@@ -121,7 +124,7 @@ class CustomBPETokenizer:
             
         return ids
 
-    def decode(self, ids: List[int]) -> str:
+    def decode(self, ids: List[int], *args, **kwargs) -> str:
         """
         Decodes a list of token IDs back into standard UTF-8 string by expanding bytes.
         """
@@ -164,6 +167,9 @@ class CustomBPETokenizer:
             
         self.vocab_size = data["vocab_size"]
         self.special_tokens = data["special_tokens"]
+        self.bos_token_id = self.special_tokens.get("<|im_start|>")
+        self.eos_token_id = self.special_tokens.get("<|im_end|>")
+        self.pad_token_id = self.special_tokens.get("<|pad|>")
         
         # Load merges
         self.merges = {}
