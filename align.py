@@ -82,8 +82,28 @@ def compute_dpo_loss(
     
     return loss, chosen_rewards.mean(), rejected_rewards.mean(), accuracy
 
+def construct_multimodal_mask(attention_mask, num_patches, device):
+    """
+    Constructs a 2D causal + padding mask of shape [B, 1, total_len, total_len] for VLM training.
+    attention_mask: [B, max_seq_len] (1 for valid text token, 0 for padding)
+    """
+    batch_size, max_seq_len = attention_mask.shape
+    total_len = num_patches + max_seq_len
+    
+    mask = torch.full((batch_size, 1, total_len, total_len), float("-inf"), device=device)
+    causal_grid = torch.triu(torch.full((total_len, total_len), True, device=device), diagonal=1)
+    
+    for b in range(batch_size):
+        valid_text_len = int(attention_mask[b].sum().item())
+        valid_total_len = num_patches + valid_text_len
+        allowed = ~causal_grid[:valid_total_len, :valid_total_len]
+        mask[b, 0, :valid_total_len, :valid_total_len] = torch.where(allowed, 0.0, float("-inf"))
+        
+    return mask
+
+
 @torch.no_grad()
-def evaluate_val_loss(policy_model, reference_model, val_dataloader, device, dtype, beta, ddp):
+def evaluate_val_loss(policy_model, reference_model, val_dataloader, device, dtype, beta, ddp, use_multimodal=False):
     """
     Evaluates policy vs reference model on validation dataset.
     Returns (avg_val_loss, avg_val_accuracy).
@@ -99,18 +119,49 @@ def evaluate_val_loss(policy_model, reference_model, val_dataloader, device, dty
         r_input_ids = batch["rejected_input_ids"].to(device, non_blocking=True)
         r_labels = batch["rejected_labels"].to(device, non_blocking=True)
         
+        pixel_values = batch.get("pixel_values", None)
+        if pixel_values is not None:
+            pixel_values = pixel_values.to(device, non_blocking=True)
+            
+        chosen_mask = None
+        rejected_mask = None
+        if use_multimodal:
+            num_patches = pixel_values.size(1) if pixel_values is not None else 0
+            chosen_mask = construct_multimodal_mask(
+                batch["chosen_attention_mask"].to(device),
+                num_patches=num_patches,
+                device=device
+            )
+            rejected_mask = construct_multimodal_mask(
+                batch["rejected_attention_mask"].to(device),
+                num_patches=num_patches,
+                device=device
+            )
+            
+            c_labels_padded = torch.cat([
+                torch.full((c_labels.size(0), num_patches), -100, dtype=torch.long, device=c_labels.device),
+                c_labels
+            ], dim=1)
+            r_labels_padded = torch.cat([
+                torch.full((r_labels.size(0), num_patches), -100, dtype=torch.long, device=r_labels.device),
+                r_labels
+            ], dim=1)
+        else:
+            c_labels_padded = c_labels
+            r_labels_padded = r_labels
+        
         with torch.amp.autocast("cuda", dtype=dtype, enabled=torch.cuda.is_available()):
-            policy_chosen_logits, _, _ = policy_model(c_input_ids)
-            policy_chosen_logprobs = compute_logprobs(policy_chosen_logits, c_labels)
+            policy_chosen_logits, _, _ = policy_model(c_input_ids, pixel_values=pixel_values, mask=chosen_mask)
+            policy_chosen_logprobs = compute_logprobs(policy_chosen_logits, c_labels_padded)
             
-            policy_rejected_logits, _, _ = policy_model(r_input_ids)
-            policy_rejected_logprobs = compute_logprobs(policy_rejected_logits, r_labels)
+            policy_rejected_logits, _, _ = policy_model(r_input_ids, pixel_values=pixel_values, mask=rejected_mask)
+            policy_rejected_logprobs = compute_logprobs(policy_rejected_logits, r_labels_padded)
             
-            ref_chosen_logits, _, _ = reference_model(c_input_ids)
-            ref_chosen_logprobs = compute_logprobs(ref_chosen_logits, c_labels)
+            ref_chosen_logits, _, _ = reference_model(c_input_ids, pixel_values=pixel_values, mask=chosen_mask)
+            ref_chosen_logprobs = compute_logprobs(ref_chosen_logits, c_labels_padded)
             
-            ref_rejected_logits, _, _ = reference_model(r_input_ids)
-            ref_rejected_logprobs = compute_logprobs(ref_rejected_logits, r_labels)
+            ref_rejected_logits, _, _ = reference_model(r_input_ids, pixel_values=pixel_values, mask=rejected_mask)
+            ref_rejected_logprobs = compute_logprobs(ref_rejected_logits, r_labels_padded)
             
         loss, _, _, accuracy = compute_dpo_loss(
             policy_chosen_logprobs=policy_chosen_logprobs,
@@ -154,6 +205,7 @@ def train():
     parser.add_argument("--weight_decay", type=float, default=0.01, help="AdamW weight decay multiplier")
     parser.add_argument("--output_dir", type=str, default="./outputs_dpo", help="Output saving directory")
     parser.add_argument("--seed", type=int, default=42, help="Random initialization seed")
+    parser.add_argument("--use_multimodal", action="store_true", help="Enable VLM multimodal DPO data loader")
     args = parser.parse_args()
 
     # 1. Initialize PyTorch DDP
@@ -182,19 +234,34 @@ def train():
     torch.manual_seed(args.seed + ddp_rank)
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Load configurations first to get vision_dim
+    logger.info(f"Loading base checkpoint config from {args.sft_checkpoint_path}...")
+    model_config, state_dict = load_checkpoint_with_fp8_translation(args.sft_checkpoint_path, map_location="cpu")
+
     # 2. Tokenizer & Dataset Loader
     logger.info("Initializing tokenizer...")
     model_dir = os.path.dirname(args.sft_checkpoint_path)
     tokenizer_path = model_dir if model_dir and os.path.exists(os.path.join(model_dir, "tokenizer_config.json")) else "qwen/Qwen2.5-7B"
     tokenizer = load_tokenizer(fallback_model_name=tokenizer_path)
 
-    dataset = DPODataset(
-        data_path=args.data_path, 
-        tokenizer=tokenizer, 
-        max_prompt_length=args.max_prompt_length,
-        max_length=args.max_length
-    )
-    validate_dataset(dataset, tokenizer=tokenizer, name="DPO training dataset")
+    if args.use_multimodal:
+        from data import MultimodalDPODataset
+        vision_dim = getattr(model_config, "vision_dim", 1152) or 1152
+        dataset = MultimodalDPODataset(
+            data_path=args.data_path, 
+            tokenizer=tokenizer, 
+            max_prompt_length=args.max_prompt_length,
+            max_length=args.max_length,
+            vision_dim=vision_dim
+        )
+    else:
+        dataset = DPODataset(
+            data_path=args.data_path, 
+            tokenizer=tokenizer, 
+            max_prompt_length=args.max_prompt_length,
+            max_length=args.max_length
+        )
+        validate_dataset(dataset, tokenizer=tokenizer, name="DPO training dataset")
     
     # Split dataset into train and validation sets (90% train, 10% val)
     val_size = int(0.1 * len(dataset))
@@ -221,6 +288,31 @@ def train():
                 torch.cat([x, torch.tensor([pad_val] * (max_len - x.size(0)), dtype=torch.long)])
                 for x in tensor_list
             ])
+            
+        if args.use_multimodal:
+            # Extract attention masks (needed to construct multimodal causal mask)
+            for name, key in [("chosen_attention_mask", "chosen_input_ids"), ("rejected_attention_mask", "rejected_input_ids")]:
+                batch[name] = torch.stack([
+                    torch.cat([torch.ones(len(item[key]), dtype=torch.long), torch.zeros(batch[key].size(1) - len(item[key]), dtype=torch.long)])
+                    for item in samples
+                ])
+                
+            # Extract pixel values
+            batch_pixel_values = []
+            has_images = False
+            num_patches = 16
+            vision_dim = getattr(model_config, "vision_dim", 1152) or 1152
+            for item in samples:
+                p_val = item.get("pixel_values", None)
+                if p_val is not None:
+                    has_images = True
+                    batch_pixel_values.append(p_val)
+                    num_patches = p_val.size(0)
+                else:
+                    batch_pixel_values.append(torch.zeros(num_patches, vision_dim))
+            if has_images:
+                batch["pixel_values"] = torch.stack(batch_pixel_values)
+                
         return batch
 
     dataloader = DataLoader(
@@ -242,9 +334,6 @@ def train():
     assert_grad_accum_safe(dataloader, args.grad_accum_steps, args.batch_size)
 
     # 3. Load Policy and Reference Models
-    logger.info(f"Loading base checkpoint config from {args.sft_checkpoint_path}...")
-    model_config, state_dict = load_checkpoint_with_fp8_translation(args.sft_checkpoint_path, map_location="cpu")
-    
     logger.info("Initializing POLICY Model...")
     policy_model = Transformer(model_config).to(device)
     policy_model.load_state_dict(state_dict)
@@ -293,8 +382,8 @@ def train():
     
     try:
         for epoch in range(args.epochs):
-            if sampler is not None:
-                sampler.set_epoch(epoch)
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
 
             policy_model.train()
             optimizer.zero_grad(set_to_none=True)
@@ -307,24 +396,55 @@ def train():
                 r_input_ids = batch["rejected_input_ids"].to(device, non_blocking=True)
                 r_labels = batch["rejected_labels"].to(device, non_blocking=True)
 
+                pixel_values = batch.get("pixel_values", None)
+                if pixel_values is not None:
+                    pixel_values = pixel_values.to(device, non_blocking=True)
+
+                chosen_mask = None
+                rejected_mask = None
+                if args.use_multimodal:
+                    num_patches = pixel_values.size(1) if pixel_values is not None else 0
+                    chosen_mask = construct_multimodal_mask(
+                        batch["chosen_attention_mask"].to(device),
+                        num_patches=num_patches,
+                        device=device
+                    )
+                    rejected_mask = construct_multimodal_mask(
+                        batch["rejected_attention_mask"].to(device),
+                        num_patches=num_patches,
+                        device=device
+                    )
+
+                    c_labels_padded = torch.cat([
+                        torch.full((c_labels.size(0), num_patches), -100, dtype=torch.long, device=c_labels.device),
+                        c_labels
+                    ], dim=1)
+                    r_labels_padded = torch.cat([
+                        torch.full((r_labels.size(0), num_patches), -100, dtype=torch.long, device=r_labels.device),
+                        r_labels
+                    ], dim=1)
+                else:
+                    c_labels_padded = c_labels
+                    r_labels_padded = r_labels
+
                 # --- Autocast forward pass for Policy Model ---
                 with torch.amp.autocast("cuda", dtype=dtype, enabled=torch.cuda.is_available()):
                     # Chosen forward pass
-                    policy_chosen_logits, _, _ = policy_model(c_input_ids)
-                    policy_chosen_logprobs = compute_logprobs(policy_chosen_logits, c_labels)
+                    policy_chosen_logits, _, _ = policy_model(c_input_ids, pixel_values=pixel_values, mask=chosen_mask)
+                    policy_chosen_logprobs = compute_logprobs(policy_chosen_logits, c_labels_padded)
 
                     # Rejected forward pass
-                    policy_rejected_logits, _, _ = policy_model(r_input_ids)
-                    policy_rejected_logprobs = compute_logprobs(policy_rejected_logits, r_labels)
+                    policy_rejected_logits, _, _ = policy_model(r_input_ids, pixel_values=pixel_values, mask=rejected_mask)
+                    policy_rejected_logprobs = compute_logprobs(policy_rejected_logits, r_labels_padded)
 
                 # --- Autocast forward pass for Reference Model (no gradient tracking) ---
                 with torch.no_grad():
                     with torch.amp.autocast("cuda", dtype=dtype, enabled=torch.cuda.is_available()):
-                        ref_chosen_logits, _, _ = reference_model(c_input_ids)
-                        ref_chosen_logprobs = compute_logprobs(ref_chosen_logits, c_labels)
+                        ref_chosen_logits, _, _ = reference_model(c_input_ids, pixel_values=pixel_values, mask=chosen_mask)
+                        ref_chosen_logprobs = compute_logprobs(ref_chosen_logits, c_labels_padded)
 
-                        ref_rejected_logits, _, _ = reference_model(r_input_ids)
-                        ref_rejected_logprobs = compute_logprobs(ref_rejected_logits, r_labels)
+                        ref_rejected_logits, _, _ = reference_model(r_input_ids, pixel_values=pixel_values, mask=rejected_mask)
+                        ref_rejected_logprobs = compute_logprobs(ref_rejected_logits, r_labels_padded)
 
                 # --- Compute Raw DPO Loss ---
                 loss, reward_c, reward_r, accuracy = compute_dpo_loss(
@@ -361,7 +481,8 @@ def train():
                             device=device,
                             dtype=dtype,
                             beta=args.beta,
-                            ddp=ddp
+                            ddp=ddp,
+                            use_multimodal=args.use_multimodal
                         )
                         if is_master:
                             tracker.log({

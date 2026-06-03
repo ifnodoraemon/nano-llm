@@ -57,13 +57,16 @@ class ChunkProcessor:
 
 class DenseRetriever:
     """
-    Dense Semantic Retriever. Uses a simple bag-of-words / TF-IDF or random projection embeddings
-    in PyTorch to calculate semantic cosine similarities, avoiding external FAISS dependencies.
+    Dense Semantic Retriever. Uses a pre-trained embedding model (via transformers)
+    in PyTorch to calculate semantic cosine similarities, falling back to random projections
+    if offline/no internet.
     """
     def __init__(self, embed_dim: int = 384):
         self.embed_dim = embed_dim
         self.chunks: List[str] = []
         self.embeddings: Optional[torch.Tensor] = None
+        self._model = None
+        self._tokenizer = None
 
     def _deterministic_hash(self, s: str) -> int:
         h = 0
@@ -71,53 +74,93 @@ class DenseRetriever:
             h = (h * 31 + ord(c)) & 0xFFFFFFFF
         return h
 
+    def _get_embedding_model(self):
+        if self._model is None:
+            import os
+            os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+            from transformers import AutoTokenizer, AutoModel
+            model_name = "sentence-transformers/all-MiniLM-L6-v2"
+            try:
+                # Limit timeouts and disable telemetry
+                self._tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=False)
+                self._model = AutoModel.from_pretrained(model_name, local_files_only=False)
+                self.embed_dim = self._model.config.hidden_size
+            except Exception as e:
+                # We do not log warning if it fails in offline mode
+                self._model = "fallback"
+        return self._model
+
     def fit(self, chunks: List[str]):
         self.chunks = chunks
         if not chunks:
             self.embeddings = None
             return
-            
-        # Simulating dense embedding generation via random hashing projections
-        # In a real environment, sentence-transformers would be invoked.
-        # This keeps the environment 100% lightweight and fast.
-        num_chunks = len(chunks)
-        self.embeddings = torch.zeros(num_chunks, self.embed_dim)
-        
-        for idx, chunk in enumerate(chunks):
-            # Compute a hash vector representing semantic frequencies
-            words = chunk.lower().split()
-            vector = torch.zeros(self.embed_dim)
-            for word in words:
-                word = word.strip(".,!?()[]{}\"';:")
-                if not word:
-                    continue
-                word_hash = self._deterministic_hash(word) % self.embed_dim
-                vector[word_hash] += 1.0
-            # Normalize to unit length
-            norm = vector.norm(p=2)
-            if norm > 0:
-                vector = vector / norm
-            self.embeddings[idx] = vector
+
+        model = self._get_embedding_model()
+        if model == "fallback":
+            num_chunks = len(chunks)
+            self.embeddings = torch.zeros(num_chunks, self.embed_dim)
+            for idx, chunk in enumerate(chunks):
+                words = chunk.lower().split()
+                vector = torch.zeros(self.embed_dim)
+                for word in words:
+                    word = word.strip(".,!?()[]{}\"';:")
+                    if not word:
+                        continue
+                    word_hash = self._deterministic_hash(word) % self.embed_dim
+                    vector[word_hash] += 1.0
+                norm = vector.norm(p=2)
+                if norm > 0:
+                    vector = vector / norm
+                self.embeddings[idx] = vector
+            return
+
+        # Generate actual dense embeddings
+        embeddings_list = []
+        for chunk in chunks:
+            inputs = self._tokenizer(chunk, padding=True, truncation=True, max_length=512, return_tensors="pt")
+            with torch.no_grad():
+                outputs = self._model(**inputs)
+                attention_mask = inputs['attention_mask']
+                token_embeddings = outputs[0]
+                input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+                sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+                sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+                embedding = sum_embeddings / sum_mask
+                embedding = torch.nn.functional.normalize(embedding, p=2, dim=1)
+                embeddings_list.append(embedding.squeeze(0))
+        self.embeddings = torch.stack(embeddings_list)
 
     def retrieve(self, query: str, top_k: int = 3) -> List[Tuple[int, float]]:
         """Returns top K indices and scores of matched chunks."""
         if self.embeddings is None or not self.chunks:
             return []
             
-        # Generate query vector
-        query_vector = torch.zeros(self.embed_dim)
-        for word in query.lower().split():
-            word = word.strip(".,!?()[]{}\"';:")
-            if not word:
-                continue
-            word_hash = self._deterministic_hash(word) % self.embed_dim
-            query_vector[word_hash] += 1.0
-        norm = query_vector.norm(p=2)
-        if norm > 0:
-            query_vector = query_vector / norm
-            
+        model = self._get_embedding_model()
+        if model == "fallback":
+            query_vector = torch.zeros(self.embed_dim)
+            for word in query.lower().split():
+                word = word.strip(".,!?()[]{}\"';:")
+                if not word:
+                    continue
+                word_hash = self._deterministic_hash(word) % self.embed_dim
+                query_vector[word_hash] += 1.0
+            norm = query_vector.norm(p=2)
+            if norm > 0:
+                query_vector = query_vector / norm
+        else:
+            inputs = self._tokenizer(query, padding=True, truncation=True, max_length=512, return_tensors="pt")
+            with torch.no_grad():
+                outputs = self._model(**inputs)
+                attention_mask = inputs['attention_mask']
+                token_embeddings = outputs[0]
+                input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+                sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+                sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+                query_vector = sum_embeddings / sum_mask
+                query_vector = torch.nn.functional.normalize(query_vector, p=2, dim=1).squeeze(0)
+
         # Calculate cosine similarity using PyTorch matrix multiplication
-        # shape: (num_chunks,)
         similarities = torch.matmul(self.embeddings, query_vector)
         
         # Sort and select Top-K

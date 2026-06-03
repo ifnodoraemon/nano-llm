@@ -187,7 +187,7 @@ def main():
     parser = argparse.ArgumentParser(description="nano-llm: custom SentencePiece/minbpe Tokenizer Trainer")
     parser.add_argument("--src_dir", type=str, default="./data/cleaned_corpus", help="Directory containing deduplicated .txt files")
     parser.add_argument("--output_file", type=str, default="./data/custom_tokenizer.json", help="Path to save trained tokenizer rules")
-    parser.add_argument("--vocab_size", type=int, default=1500, help="Target vocabulary size (e.g. 1000 to 5000)")
+    parser.add_argument("--vocab_size", type=int, default=32000, help="Target vocabulary size (e.g. 32000 or 65536)")
     args = parser.parse_args()
     
     os.makedirs(os.path.dirname(args.output_file), exist_ok=True)

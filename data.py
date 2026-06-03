@@ -1,5 +1,8 @@
 import json
 import logging
+import os
+import math
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 from typing import Dict, List, Any, Optional
@@ -334,13 +337,58 @@ class MultimodalSFTDataset(Dataset):
             labels = labels[:self.max_length]
             
         # Process image features if image exists
-        if image_path is not None:
-            # In standard production VLMs, we would run SigLIP/ViT feature extraction.
-            # To be 100% stable, zero-dependency, and offline-compatible:
-            # We generate simulated high-quality visual feature maps representing the image patches!
-            pixel_values = torch.randn(self.num_patches, self.vision_dim)
+        if image_path is not None and os.path.exists(image_path):
+            try:
+                from PIL import Image
+                
+                img = Image.open(image_path).convert("RGB")
+                
+                # Check if we can load SigLIP processor and model to extract real features
+                os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+                from transformers import AutoProcessor, AutoModel
+                
+                # Compact SigLIP model to extract real features
+                model_name = "google/siglip-base-patch16-224"
+                processor = AutoProcessor.from_pretrained(model_name, local_files_only=False)
+                vision_model = AutoModel.from_pretrained(model_name, local_files_only=False)
+                
+                inputs = processor(images=img, return_tensors="pt")
+                with torch.no_grad():
+                    outputs = vision_model.vision_model(inputs.pixel_values)
+                    # Shape: [num_patches, vision_dim] (e.g. 196 patches, 768 dim)
+                    last_hidden_state = outputs.last_hidden_state.squeeze(0)
+                    
+                # If number of patches or vision dim does not match, project it
+                if last_hidden_state.shape[-1] != self.vision_dim:
+                    proj = torch.nn.Linear(last_hidden_state.shape[-1], self.vision_dim)
+                    pixel_values = proj(last_hidden_state).detach()
+                else:
+                    pixel_values = last_hidden_state
+            except Exception as e:
+                logger.warning(f"Could not extract features using SigLIP model ({e}). Falling back to simple patch extraction.")
+                try:
+                    img = Image.open(image_path).convert("RGB")
+                    img = img.resize((224, 224))
+                    img_t = torch.tensor(np.array(img), dtype=torch.float32) / 255.0
+                    
+                    patch_w = img_t.shape[1] // int(math.sqrt(self.num_patches))
+                    patches = []
+                    for r in range(int(math.sqrt(self.num_patches))):
+                        for c in range(int(math.sqrt(self.num_patches))):
+                            patch = img_t[r*patch_w:(r+1)*patch_w, c*patch_w:(c+1)*patch_w, :]
+                            patches.append(patch.flatten())
+                    flat_patches = torch.stack(patches)
+                    proj = torch.nn.Linear(flat_patches.shape[-1], self.vision_dim)
+                    pixel_values = proj(flat_patches).detach()
+                except Exception as ex:
+                    logger.error(f"Image load fallback failed: {ex}. Falling back to random projection.")
+                    pixel_values = torch.randn(self.num_patches, self.vision_dim)
         else:
-            pixel_values = None
+            if image_path is not None:
+                logger.warning(f"Multimodal image path not found: {image_path}. Using random features.")
+                pixel_values = torch.randn(self.num_patches, self.vision_dim)
+            else:
+                pixel_values = None
             
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
@@ -405,4 +453,129 @@ class MultimodalSequenceCollator:
             collated["pixel_values"] = torch.stack(batch_pixel_values)
             
         return collated
+
+
+class MultimodalDPODataset(Dataset):
+    """
+    Multimodal DPO Dataset containing prompt (with optional image) + chosen + rejected responses.
+    """
+    def __init__(self, data_path: str, tokenizer, max_prompt_length: int = 2048, max_length: int = 4096, vision_dim: int = 1152, num_patches: int = 16):
+        self.tokenizer = tokenizer
+        self.max_prompt_length = max_prompt_length
+        self.max_length = max_length
+        self.vision_dim = vision_dim
+        self.num_patches = num_patches
+        self.formatter = ChatFormatter()
+        
+        logger.info(f"Loading multimodal DPO preference pairs from {data_path}...")
+        self.samples = []
+        with open(data_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    data = json.loads(line)
+                    if all(k in data for k in ["prompt", "chosen", "rejected"]):
+                        self.samples.append(data)
+                except Exception as e:
+                    logger.error(f"Error parsing line: {e}")
+                    
+        logger.info(f"Loaded {len(self.samples)} multimodal preference alignment samples.")
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        item = self.samples[idx]
+        image_path = item.get("image", None)
+        
+        # 1. Format and tokenize prompt context
+        prompt_text = ""
+        for msg in item["prompt"]:
+            prompt_text += self.formatter.format_message(msg)
+            
+        try:
+            prompt_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
+        except TypeError:
+            prompt_ids = self.tokenizer.encode(prompt_text)
+        if len(prompt_ids) > self.max_prompt_length:
+            prompt_ids = prompt_ids[-self.max_prompt_length:]
+            
+        # 2. Format and tokenize chosen & rejected answers
+        chosen_text = self.formatter.format_message(item["chosen"])
+        rejected_text = self.formatter.format_message(item["rejected"])
+        
+        try:
+            chosen_ids = self.tokenizer.encode(chosen_text, add_special_tokens=False)
+        except TypeError:
+            chosen_ids = self.tokenizer.encode(chosen_text)
+        try:
+            rejected_ids = self.tokenizer.encode(rejected_text, add_special_tokens=False)
+        except TypeError:
+            rejected_ids = self.tokenizer.encode(rejected_text)
+            
+        # Combine prompt with chosen & rejected up to max_length
+        max_ans_len = self.max_length - len(prompt_ids)
+        chosen_ids = chosen_ids[:max_ans_len]
+        rejected_ids = rejected_ids[:max_ans_len]
+        
+        chosen_input_ids = prompt_ids + chosen_ids
+        rejected_input_ids = prompt_ids + rejected_ids
+        
+        chosen_labels = [-100] * len(prompt_ids) + chosen_ids
+        rejected_labels = [-100] * len(prompt_ids) + rejected_ids
+        
+        # Extract image features if present
+        pixel_values = None
+        if image_path is not None and os.path.exists(image_path):
+            try:
+                from PIL import Image
+                img = Image.open(image_path).convert("RGB")
+                
+                os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+                from transformers import AutoProcessor, AutoModel
+                model_name = "google/siglip-base-patch16-224"
+                processor = AutoProcessor.from_pretrained(model_name, local_files_only=False)
+                vision_model = AutoModel.from_pretrained(model_name, local_files_only=False)
+                
+                inputs = processor(images=img, return_tensors="pt")
+                with torch.no_grad():
+                    outputs = vision_model.vision_model(inputs.pixel_values)
+                    last_hidden_state = outputs.last_hidden_state.squeeze(0)
+                    
+                if last_hidden_state.shape[-1] != self.vision_dim:
+                    proj = torch.nn.Linear(last_hidden_state.shape[-1], self.vision_dim)
+                    pixel_values = proj(last_hidden_state).detach()
+                else:
+                    pixel_values = last_hidden_state
+            except Exception as e:
+                logger.warning(f"Could not extract features using SigLIP model ({e}). Falling back to simple patch extraction.")
+                try:
+                    img = Image.open(image_path).convert("RGB")
+                    img = img.resize((224, 224))
+                    img_t = torch.tensor(np.array(img), dtype=torch.float32) / 255.0
+                    patch_w = img_t.shape[1] // int(math.sqrt(self.num_patches))
+                    patches = []
+                    for r in range(int(math.sqrt(self.num_patches))):
+                        for c in range(int(math.sqrt(self.num_patches))):
+                            patch = img_t[r*patch_w:(r+1)*patch_w, c*patch_w:(c+1)*patch_w, :]
+                            patches.append(patch.flatten())
+                    flat_patches = torch.stack(patches)
+                    proj = torch.nn.Linear(flat_patches.shape[-1], self.vision_dim)
+                    pixel_values = proj(flat_patches).detach()
+                except Exception as ex:
+                    logger.error(f"Image load fallback failed: {ex}. Falling back to random projection.")
+                    pixel_values = torch.randn(self.num_patches, self.vision_dim)
+        else:
+            if image_path is not None:
+                logger.warning(f"Multimodal image path not found: {image_path}. Using random features.")
+                pixel_values = torch.randn(self.num_patches, self.vision_dim)
+                
+        return {
+            "chosen_input_ids": torch.tensor(chosen_input_ids, dtype=torch.long),
+            "chosen_labels": torch.tensor(chosen_labels, dtype=torch.long),
+            "rejected_input_ids": torch.tensor(rejected_input_ids, dtype=torch.long),
+            "rejected_labels": torch.tensor(rejected_labels, dtype=torch.long),
+            "pixel_values": pixel_values
+        }
 

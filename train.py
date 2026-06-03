@@ -42,8 +42,28 @@ def construct_block_diagonal_mask(seqlens_list, max_length, device):
     return mask
 
 
+def construct_multimodal_mask(attention_mask, num_patches, device):
+    """
+    Constructs a 2D causal + padding mask of shape [B, 1, total_len, total_len] for VLM training.
+    attention_mask: [B, max_seq_len] (1 for valid text token, 0 for padding)
+    """
+    batch_size, max_seq_len = attention_mask.shape
+    total_len = num_patches + max_seq_len
+    
+    mask = torch.full((batch_size, 1, total_len, total_len), float("-inf"), device=device)
+    causal_grid = torch.triu(torch.full((total_len, total_len), True, device=device), diagonal=1)
+    
+    for b in range(batch_size):
+        valid_text_len = int(attention_mask[b].sum().item())
+        valid_total_len = num_patches + valid_text_len
+        allowed = ~causal_grid[:valid_total_len, :valid_total_len]
+        mask[b, 0, :valid_total_len, :valid_total_len] = torch.where(allowed, 0.0, float("-inf"))
+        
+    return mask
+
+
 @torch.no_grad()
-def evaluate_val_loss(model, dataloader, device, ddp, max_length):
+def evaluate_val_loss(model, dataloader, device, ddp, max_length, use_multimodal=False):
     model.eval()
     total_loss = 0.0
     count = 0
@@ -52,12 +72,23 @@ def evaluate_val_loss(model, dataloader, device, ddp, max_length):
         labels = batch["labels"].to(device, non_blocking=True)
         
         mask = None
-        if "seqlens" in batch:
+        pixel_values = batch.get("pixel_values", None)
+        if pixel_values is not None:
+            pixel_values = pixel_values.to(device, non_blocking=True)
+            
+        if use_multimodal:
+            num_patches = pixel_values.size(1) if pixel_values is not None else 0
+            mask = construct_multimodal_mask(
+                batch["attention_mask"].to(device),
+                num_patches=num_patches,
+                device=device
+            )
+        elif "seqlens" in batch:
             mask = construct_block_diagonal_mask(batch["seqlens"], max_length, device)
             
         dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
         with torch.amp.autocast("cuda", dtype=dtype, enabled=torch.cuda.is_available()):
-            _, loss, _ = model(input_ids, targets=labels, mask=mask)
+            _, loss, _ = model(input_ids, pixel_values=pixel_values, targets=labels, mask=mask)
         total_loss += loss.item()
         count += 1
     
@@ -101,6 +132,7 @@ def train():
     parser.add_argument("--use_lora", action="store_true", help="Train only custom LoRA adapters from scratch")
     parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank dimension size")
     parser.add_argument("--lora_alpha", type=float, default=16.0, help="LoRA alpha scaling multiplier")
+    parser.add_argument("--use_multimodal", action="store_true", help="Enable VLM multimodal SFT data loader")
     args = parser.parse_args()
 
     # 1. Initialize PyTorch DDP
@@ -132,18 +164,54 @@ def train():
         
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # 2. Tokenizer & Dataset Loader
+    # 2. Tokenizer & Model Configuration Loader
     logger.info("Initializing tokenizer...")
     tokenizer = load_tokenizer(fallback_model_name=args.model_name_or_path)
 
-    dataset = SFTDataset(data_path=args.data_path, tokenizer=tokenizer, max_length=args.max_length)
-    validate_dataset(dataset, tokenizer=tokenizer, name="SFT training dataset")
+    logger.info("Assembling custom LLaMA Transformer architecture config...")
+    base_checkpoint_path = args.model_name_or_path
+    if not os.path.exists(base_checkpoint_path) and os.path.exists("./outputs/checkpoint_pretrain.pt"):
+        base_checkpoint_path = "./outputs/checkpoint_pretrain.pt"
     
-    collator = SequencePackingCollator(
-        pad_token_id=tokenizer.pad_token_id,
-        max_length=args.max_length,
-        batch_size=args.batch_size
-    )
+    model_config = None
+    state_dict = None
+    has_ckpt = False
+    if os.path.exists(base_checkpoint_path):
+        logger.info(f"Found base pre-trained checkpoint at {base_checkpoint_path}. Loading configuration and weights...")
+        model_config, state_dict = load_checkpoint_with_fp8_translation(base_checkpoint_path, map_location=device)
+        has_ckpt = True
+    else:
+        logger.warning("Base pre-trained checkpoint not found. Instantiating configuration from scratch...")
+        model_config = get_deepseek_config(
+            "tiny",
+            block_size=args.max_length,
+            vocab_size=len(tokenizer),
+            lora_r=args.lora_r if args.use_lora else 0,
+            lora_alpha=args.lora_alpha
+        )
+
+    # Initialize Dataset & Collator
+    if args.use_multimodal:
+        from data import MultimodalSFTDataset, MultimodalSequenceCollator
+        vision_dim = getattr(model_config, "vision_dim", 1152) or 1152
+        dataset = MultimodalSFTDataset(
+            data_path=args.data_path,
+            tokenizer=tokenizer,
+            max_length=args.max_length,
+            vision_dim=vision_dim
+        )
+        collator = MultimodalSequenceCollator(
+            pad_token_id=tokenizer.pad_token_id,
+            vision_dim=vision_dim
+        )
+    else:
+        dataset = SFTDataset(data_path=args.data_path, tokenizer=tokenizer, max_length=args.max_length)
+        validate_dataset(dataset, tokenizer=tokenizer, name="SFT training dataset")
+        collator = SequencePackingCollator(
+            pad_token_id=tokenizer.pad_token_id,
+            max_length=args.max_length,
+            batch_size=args.batch_size
+        )
 
     # Split dataset into train and validation sets (90% train, 10% val)
     val_size = int(0.1 * len(dataset))
@@ -155,9 +223,9 @@ def train():
     train_sampler = DistributedSampler(train_dataset, num_replicas=ddp_world_size, rank=ddp_rank, shuffle=True) if ddp else None
     val_sampler = DistributedSampler(val_dataset, num_replicas=ddp_world_size, rank=ddp_rank, shuffle=False) if ddp else None
 
-    # Enlarge DataLoader micro-batch size by 6x to ensure collator gets enough samples to pack fully
-    dataloader_batch_size = args.batch_size * 6
-    val_dataloader_batch_size = args.batch_size * 6
+    # Enlarge DataLoader micro-batch size by 6x to ensure collator gets enough samples to pack fully if not multimodal
+    dataloader_batch_size = args.batch_size * 6 if not args.use_multimodal else args.batch_size
+    val_dataloader_batch_size = args.batch_size * 6 if not args.use_multimodal else args.batch_size
 
     dataloader = DataLoader(
         train_dataset, 
@@ -179,30 +247,11 @@ def train():
 
     # 3. Load Modern LLaMA Model with custom LoRA configurations
     logger.info("Assembling custom LLaMA Transformer architecture...")
-    base_checkpoint_path = args.model_name_or_path
-    if not os.path.exists(base_checkpoint_path) and os.path.exists("./outputs/checkpoint_pretrain.pt"):
-        base_checkpoint_path = "./outputs/checkpoint_pretrain.pt"
-    
     restored_step = 0
-    has_ckpt = False
-    if os.path.exists(base_checkpoint_path):
-        logger.info(f"Found base pre-trained checkpoint at {base_checkpoint_path}. Loading configuration and weights...")
-        model_config, state_dict = load_checkpoint_with_fp8_translation(base_checkpoint_path, map_location=device)
-        model_config.use_checkpoint = True  # Enable memory-saving activation checkpointing!
-        model = Transformer(model_config).to(device)
+    model_config.use_checkpoint = True  # Enable memory-saving activation checkpointing!
+    model = Transformer(model_config).to(device)
+    if has_ckpt and state_dict is not None:
         model.load_state_dict(state_dict)
-        has_ckpt = True
-    else:
-        logger.warning("Base pre-trained checkpoint not found. Instantiating model from scratch...")
-        model_config = get_deepseek_config(
-            "tiny",
-            block_size=args.max_length,
-            vocab_size=len(tokenizer),
-            lora_r=args.lora_r if args.use_lora else 0,
-            lora_alpha=args.lora_alpha
-        )
-        model_config.use_checkpoint = True  # Enable memory-saving activation checkpointing!
-        model = Transformer(model_config).to(device)
     
     # If use_lora is active, freeze base layer parameters before creating optimizer
     if args.use_lora:
@@ -272,14 +321,25 @@ def train():
             for batch_idx, batch in enumerate(dataloader):
                 input_ids = batch["input_ids"].to(device, non_blocking=True)
                 labels = batch["labels"].to(device, non_blocking=True)
+                
+                pixel_values = batch.get("pixel_values", None)
+                if pixel_values is not None:
+                    pixel_values = pixel_values.to(device, non_blocking=True)
 
                 dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
                 mask = None
-                if "seqlens" in batch:
+                if args.use_multimodal:
+                    num_patches = pixel_values.size(1) if pixel_values is not None else 0
+                    mask = construct_multimodal_mask(
+                        batch["attention_mask"].to(device),
+                        num_patches=num_patches,
+                        device=device
+                    )
+                elif "seqlens" in batch:
                     mask = construct_block_diagonal_mask(batch["seqlens"], args.max_length, device)
 
                 with torch.amp.autocast("cuda", dtype=dtype, enabled=torch.cuda.is_available()):
-                    logits, loss, _ = model(input_ids, targets=labels, mask=mask)
+                    logits, loss, _ = model(input_ids, pixel_values=pixel_values, targets=labels, mask=mask)
                     loss = loss / args.grad_accum_steps
 
                 epoch_loss += loss.item() * args.grad_accum_steps
@@ -321,7 +381,7 @@ def train():
 
                     # Periodic Validation Loop
                     if step_counter % 100 == 0:
-                        val_loss = evaluate_val_loss(model, val_dataloader, device, ddp, args.max_length)
+                        val_loss = evaluate_val_loss(model, val_dataloader, device, ddp, args.max_length, use_multimodal=args.use_multimodal)
                         if is_master:
                             tracker.log({"sft/val_loss": val_loss}, step=step_counter)
                             logger.info(f"🏆 Step {step_counter} | Validation Loss: {val_loss:.4f}")
@@ -367,7 +427,7 @@ def train():
                         }, checkpoint_path)
 
             avg_epoch_loss = epoch_loss / len(dataloader)
-            val_loss = evaluate_val_loss(model, val_dataloader, device, ddp, args.max_length)
+            val_loss = evaluate_val_loss(model, val_dataloader, device, ddp, args.max_length, use_multimodal=args.use_multimodal)
             if is_master:
                 logger.info(f"--- Epoch {epoch+1} completed! Average Loss: {avg_epoch_loss:.4f} | Validation Loss: {val_loss:.4f} ---")
                 tracker.log({"sft/epoch_val_loss": val_loss}, step=step_counter)

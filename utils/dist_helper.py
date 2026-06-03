@@ -31,9 +31,8 @@ def autotune_nccl():
     has_roce = any("roce" in iface or "mlx" in iface for iface in active_interfaces)
     eth_interfaces = [iface for iface in active_interfaces if iface.startswith(("eth", "en", "wl", "bond"))]
     
-    # Autotuned environment variables mapping
     tuned_vars = {
-        "NCCL_DEBUG": "WARN",
+        "NCCL_DEBUG": "INFO",
         "NCCL_DEBUG_SUBSYS": "INIT",
         "NCCL_BUFFSIZE": "4194304", # Set 4MB socket cache buffer to saturate high bandwidth links
         "OMP_NUM_THREADS": "8"
