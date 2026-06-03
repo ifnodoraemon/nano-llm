@@ -70,6 +70,22 @@
 
 ## 6. 🗂️ ModelScope 统一模型地址配置 (替代 Model Size 校验)
 * **问题描述**：旧版本的 `config.py` 和加载引擎过度依赖对硬编码 `model_size` 字段（如 `tiny`、`2B-dense`）的校验，如果使用国内的高速 ModelScope (MS) 镜像拉取，解析 HF 模型 ID 时经常因为找不到预设Preset而报错。
-* **重构逻辑**：
-  * 我们提供标准的 ModelScope 统一加载接口 [HubAdapter](file:///home/ifnodoraemon/myagent/nano-llm/utils/hub_adapter.py#L33)。用户在训练或加载时，只需在 `--model_name_or_path` 直接指定 ModelScope 平台的标准模型 ID 地址（如 `qwen/Qwen2.5-7B-Instruct` 或 `qwen/Qwen2.5-1.5B`）。
-  * 平台内部会自动重定向至 ModelScope 的 Mainland China 高速镜像节点进行毫秒级自动拉取，不再进行无意义的模型尺寸强绑定拦截。
+* **重构与推荐的 ModelScope 地址**：
+  * 我们集成了标准的 ModelScope 统一加载接口 [HubAdapter](file:///home/ifnodoraemon/myagent/nano-llm/utils/hub_adapter.py#L33)。用户在训练或加载时，只需在 `--model_name_or_path` 直接指定 ModelScope 平台的标准模型 ID 地址，不再进行模型尺寸的强绑定拦截。
+  * **推荐的标准 ModelScope 模型地址列表**：
+    * **Qwen 2.5 7B 指令/对话模型**：`qwen/Qwen2.5-7B-Instruct`
+    * **Qwen 2.5 7B 基础/预训练模型**：`qwen/Qwen2.5-7B`
+    * **Qwen 2.5 1.5B 指令/对话模型**：`qwen/Qwen2.5-1.5B-Instruct`
+    * **Qwen 2.5 1.5B 基础/预训练模型**：`qwen/Qwen2.5-1.5B`
+    * **Qwen 2.5 0.5B 基础/预训练模型**：`qwen/Qwen2.5-0.5B`
+  * 平台内部会自动重定向至 ModelScope 的 Mainland China 高速镜像节点进行毫秒级自动拉取，同时兼容 `HF_ENDPOINT=https://hf-mirror.com` 镜像的高速 fallback 回退。
+
+---
+
+## 7. 🔄 大规模预训练“接力”训练与断点弹性恢复设计 (Relay & Fault-Tolerant Pretraining)
+* **问题背景**：针对 400B 目标语料的数据下载过程需要数天，为了充分利用集群算力，我们采用“边下载、边训练”的流水线并行化方案。初始在 `/data/nano-llm-data/binaries_1t` 数据集上开跑，400B 数据合并完成后必须能够平滑“接力”到新的 binaries 目录继续训练。
+* **解决措施**：
+  1. **非阻塞后台异步 Checkpoint 写入**：利用 [BackgroundCheckpointSaver](file:///home/ifnodoraemon/myagent/nano-llm/utils/checkpoint_saver.py#L21) 在主线程完成快速深拷贝（<100ms），并交由后台守护线程进行高耗时的磁盘 I/O，规避大模型权重保存造成的系统性迭代抖动（Jitter）。
+  2. **弹性容错自动恢复**：[ElasticRestoreManager](file:///home/ifnodoraemon/myagent/nano-llm/utils/checkpoint_saver.py#L117) 会在引擎重启时自动扫描 `training_manifest.json`，无缝拉回最新的 Step 与 Epoch 状态。
+  3. **无缝接力切换 (Dataset Relay)**：在 400B 全量数据下载合并后，只需将 `run_pretrain_mla_triton.sh` 中的 `DATA_DIR` 修改为 `/data/nano-llm-data/binaries_400b` 并重新运行。引擎会自动读取当前目录下的 `outputs_pretrain_mla_triton/checkpoint_elastic.pt`，平滑热重启并自动切换到新数据集上“接力”向后计算，实现零算力等待与无损接力。
+

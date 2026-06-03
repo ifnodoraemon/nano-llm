@@ -130,7 +130,7 @@ def train():
 
     # 2. Tokenizer & Dataset Loader
     logger.info("Initializing tokenizer...")
-    tokenizer = load_tokenizer(fallback_model_name="Qwen/Qwen2.5-7B")
+    tokenizer = load_tokenizer(fallback_model_name="qwen/Qwen2.5-7B")
 
     dataset = DPODataset(
         data_path=args.data_path, 

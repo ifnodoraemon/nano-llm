@@ -17,7 +17,7 @@ mkdir -p "$OUTPUT_DIR"
 
 # Base model path (adjust to your local model path or HuggingFace ID)
 # Used to instantiate the correct token vocabulary size and tokenizer configs
-MODEL_PATH="Qwen/Qwen2.5-7B" 
+MODEL_PATH="qwen/Qwen2.5-7B" 
 
 # Training data path (JSON Lines conversational format)
 DATA_PATH="./data/train_sft_premium.jsonl"

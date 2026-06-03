@@ -82,7 +82,7 @@ def evaluate_val_loss(model, dataloader, device, ddp, max_length):
 
 def train():
     parser = argparse.ArgumentParser(description="nano-llm: High-Performance Distributed SFT Engine")
-    parser.add_argument("--model_name_or_path", type=str, default="Qwen/Qwen2.5-7B", help="HF base model identifier")
+    parser.add_argument("--model_name_or_path", type=str, default="qwen/Qwen2.5-7B", help="ModelScope base model identifier")
     parser.add_argument("--data_path", type=str, required=True, help="Path to SFT train.jsonl file")
     parser.add_argument("--max_length", type=int, default=4096, help="Sequence context length")
     parser.add_argument("--epochs", type=int, default=3, help="Training epoch limit")

@@ -167,7 +167,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, choices=["hf2nano", "nano2hf"], required=True, help="Conversion direction")
     parser.add_argument("--src", type=str, required=True, help="Path to source model folder or checkpoint file")
     parser.add_argument("--dest", type=str, required=True, help="Target path/folder to save converted checkpoint")
-    parser.add_argument("--ref_hf", type=str, default="Qwen/Qwen2.5-7B", help="Reference HuggingFace path for configuration generation")
+    parser.add_argument("--ref_hf", type=str, default="qwen/Qwen2.5-7B", help="Reference ModelScope/HF path for configuration generation")
     args = parser.parse_args()
     
     if args.mode == "hf2nano":
