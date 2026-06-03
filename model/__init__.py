@@ -19,6 +19,8 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x: torch.Tensor, use_triton: bool = False) -> torch.Tensor:
+        if not use_triton and hasattr(torch.nn.functional, "rms_norm") and not torch.onnx.is_in_onnx_export():
+            return torch.nn.functional.rms_norm(x, self.weight.shape, self.weight, eps=self.eps)
         if use_triton:
             from utils.triton_kernels import triton_rms_norm
             return triton_rms_norm(x, self.weight, self.eps)
@@ -111,11 +113,34 @@ def apply_rotary_emb(
     xk: torch.Tensor,
     freqs_cis: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    if isinstance(freqs_cis, tuple):
+        cos, sin = freqs_cis
+    else:
+        cos = freqs_cis.real
+        sin = freqs_cis.imag
+    
+    xq_paired = xq.float().reshape(*xq.shape[:-1], -1, 2)
+    xk_paired = xk.float().reshape(*xk.shape[:-1], -1, 2)
+    
+    # Broadcast cos/sin shape [1, seq_len, 1, dim // 2]
+    cos = cos.view(1, xq.shape[1], 1, -1)
+    sin = sin.view(1, xq.shape[1], 1, -1)
+    
+    xq_r = xq_paired[..., 0]
+    xq_i = xq_paired[..., 1]
+    
+    xk_r = xk_paired[..., 0]
+    xk_i = xk_paired[..., 1]
+    
+    xq_out_r = xq_r * cos - xq_i * sin
+    xq_out_i = xq_i * cos + xq_r * sin
+    
+    xk_out_r = xk_r * cos - xk_i * sin
+    xk_out_i = xk_i * cos + xk_r * sin
+    
+    xq_out = torch.stack([xq_out_r, xq_out_i], dim=-1).flatten(3)
+    xk_out = torch.stack([xk_out_r, xk_out_i], dim=-1).flatten(3)
+    
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
@@ -345,15 +370,13 @@ class Transformer(nn.Module):
         self.norm = RMSNorm(config.n_embd, eps=config.norm_eps)
         self.output = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        self.register_buffer(
-            "freqs_cis",
-            precompute_freqs_cis(
-                dim=config.n_embd // config.n_head,
-                end=config.block_size * 2,
-                scaling_factor=config.rope_scaling
-            ),
-            persistent=False
+        freqs_cis_init = precompute_freqs_cis(
+            dim=config.n_embd // config.n_head,
+            end=config.block_size * 2,
+            scaling_factor=config.rope_scaling
         )
+        self.register_buffer("freqs_cos", freqs_cis_init.real, persistent=False)
+        self.register_buffer("freqs_sin", freqs_cis_init.imag, persistent=False)
 
         self.apply(self._init_weights)
 
@@ -422,15 +445,18 @@ class Transformer(nn.Module):
         total_seqlen = h.size(1)
         pos = start_pos if start_pos is not None else 0
         needed_end = pos + total_seqlen
-        if needed_end > self.freqs_cis.shape[0]:
+        if needed_end > self.freqs_cos.shape[0]:
             freqs_cis_full = precompute_freqs_cis(
                 dim=self.config.n_embd // self.config.n_head,
                 end=needed_end * 2,
                 scaling_factor=self.config.rope_scaling
             ).to(tokens.device)
-            freqs_cis = freqs_cis_full[pos : pos + total_seqlen]
+            freqs_cos = freqs_cis_full.real[pos : pos + total_seqlen]
+            freqs_sin = freqs_cis_full.imag[pos : pos + total_seqlen]
         else:
-            freqs_cis = self.freqs_cis[pos : pos + total_seqlen].to(tokens.device)
+            freqs_cos = self.freqs_cos[pos : pos + total_seqlen].to(tokens.device)
+            freqs_sin = self.freqs_sin[pos : pos + total_seqlen].to(tokens.device)
+        freqs_cis = (freqs_cos, freqs_sin)
 
         # 3. Autoregressive multi-modal self-attention layers
         total_aux_loss = torch.tensor(0.0, device=h.device)

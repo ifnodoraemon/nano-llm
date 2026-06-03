@@ -108,9 +108,8 @@ def convert_hf_to_nano(hf_model_path: str, output_pt_path: str):
 def convert_nano_to_hf(nano_pt_path: str, hf_config_ref_path: str, output_hf_dir: str):
     """Loads a nano-llm .pt file and exports a HuggingFace standard checkpoint directory."""
     logger.info(f"Loading nano-llm checkpoint from: {nano_pt_path}")
-    checkpoint = torch.load(nano_pt_path, map_location="cpu", weights_only=False)
-    nano_state = checkpoint["model_state_dict"]
-    nano_config = checkpoint["config"]
+    from utils.checkpoint_utils import load_checkpoint_with_fp8_translation
+    nano_config, nano_state = load_checkpoint_with_fp8_translation(nano_pt_path, map_location="cpu")
     
     # 1. Fuse LoRA weights if lora_r > 0
     if nano_config.lora_r > 0:
@@ -140,16 +139,20 @@ def convert_nano_to_hf(nano_pt_path: str, hf_config_ref_path: str, output_hf_dir
             logger.warning(f"Key missing in nano-llm checkpoint: {nano_key}")
             
     # 3. Save standard Hugging Face model
-    logger.info(f"Instantiating reference model from: {hf_config_ref_path}...")
+    logger.info(f"Loading reference config from: {hf_config_ref_path}...")
     hf_config = AutoConfig.from_pretrained(hf_config_ref_path, trust_remote_code=True)
-    hf_model = AutoModelForCausalLM.from_config(hf_config, trust_remote_code=True)
-    
-    # Copy weights directly
-    hf_model.load_state_dict(hf_state, strict=False)
     
     logger.info(f"Writing HuggingFace model checkpoint folder to: {output_hf_dir}...")
     os.makedirs(output_hf_dir, exist_ok=True)
-    hf_model.save_pretrained(output_hf_dir, safe_serialization=True)
+    hf_config.save_pretrained(output_hf_dir)
+    
+    try:
+        from safetensors.torch import save_file
+        save_file(hf_state, os.path.join(output_hf_dir, "model.safetensors"))
+        logger.info("Saved weights as model.safetensors")
+    except ImportError:
+        torch.save(hf_state, os.path.join(output_hf_dir, "pytorch_model.bin"))
+        logger.info("Saved weights as pytorch_model.bin")
     
     # Copy reference tokenizer
     from transformers import AutoTokenizer

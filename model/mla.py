@@ -111,25 +111,40 @@ class MultiHeadLatentAttention(nn.Module):
         # 4. Decoupled RoPE injection
         # Apply RoPE to query
         from model import precompute_freqs_cis
-        def apply_rotary_emb_single(tensor: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-            tensor_ = torch.view_as_complex(tensor.float().reshape(*tensor.shape[:-1], -1, 2))
-            ndim = tensor_.ndim
-            shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(tensor_.shape)]
-            freqs_reshaped = freqs.view(*shape)
-            out = torch.view_as_real(tensor_ * freqs_reshaped).flatten(3)
+        def apply_rotary_emb_single(tensor: torch.Tensor, freqs: Any) -> torch.Tensor:
+            if isinstance(freqs, tuple):
+                cos, sin = freqs
+            else:
+                cos = freqs.real
+                sin = freqs.imag
+                
+            tensor_paired = tensor.float().reshape(*tensor.shape[:-1], -1, 2)
+            cos = cos.view(1, tensor.shape[1], 1, -1)
+            sin = sin.view(1, tensor.shape[1], 1, -1)
+            
+            t_r = tensor_paired[..., 0]
+            t_i = tensor_paired[..., 1]
+            
+            out_r = t_r * cos - t_i * sin
+            out_i = t_i * cos + t_r * sin
+            
+            out = torch.stack([out_r, out_i], dim=-1).flatten(3)
             return out.type_as(tensor)
 
         xq = apply_rotary_emb_single(xq, freqs_cis)
 
         # Apply RoPE to key (sliced 0 to kv_seqlen)
-        if not hasattr(self, 'freqs_cis') or self.freqs_cis.shape[0] < kv_seqlen:
-            self.freqs_cis = precompute_freqs_cis(
+        if not hasattr(self, 'freqs_cos') or self.freqs_cos.shape[0] < kv_seqlen:
+            freqs_cis_k_full = precompute_freqs_cis(
                 dim=self.head_dim,
                 end=max(kv_seqlen * 2, 4096),
                 scaling_factor=self.config.rope_scaling
             ).to(xq.device)
-        freqs_cis_k = self.freqs_cis[:kv_seqlen]
-        xk = apply_rotary_emb_single(xk, freqs_cis_k)
+            self.freqs_cos = freqs_cis_k_full.real
+            self.freqs_sin = freqs_cis_k_full.imag
+            
+        freqs_k = (self.freqs_cos[:kv_seqlen], self.freqs_sin[:kv_seqlen])
+        xk = apply_rotary_emb_single(xk, freqs_k)
 
         if self.config.use_triton_mla:
             from utils.triton_kernels import triton_mla_flash_attn
