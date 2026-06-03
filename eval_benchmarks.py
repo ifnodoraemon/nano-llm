@@ -513,6 +513,21 @@ def evaluate_perplexity(model: Transformer, val_bin_path: str = "./data/binaries
         return float('inf')
 
 # ==============================================================================
+@torch.no_grad()
+def evaluate_progressive_perplexity(model: Transformer, val_bin_path: str = "./data/binaries/val.bin", device: str = "cuda") -> dict:
+    """Evaluates intrinsic perplexity progressively across context lengths."""
+    block_size = model.config.block_size
+    test_lengths = [1024, 2048, 4096, 8192, 16384]
+    test_lengths = [l for l in test_lengths if l <= block_size]
+    
+    results = {}
+    logger.info(f"--- Initiating Progressive Perplexity (PPL) Scan for lengths {test_lengths} ---")
+    for l in test_lengths:
+        ppl = evaluate_perplexity(model, val_bin_path=val_bin_path, block_size=l, num_batches=min(100, (block_size * 100) // l), device=device)
+        results[f"perplexity_len_{l}"] = ppl
+    return results
+
+# ==============================================================================
 # Main Orchestrated Runner
 # ==============================================================================
 
@@ -525,6 +540,7 @@ def main():
     parser.add_argument("--arc_path", type=str, default="./data/eval/arc.jsonl", help="Path to ARC Challenge JSONL file")
     parser.add_argument("--hellaswag_path", type=str, default="./data/eval/hellaswag.jsonl", help="Path to HellaSwag JSONL file")
     parser.add_argument("--humaneval_path", type=str, default="./data/eval/humaneval.jsonl", help="Path to HumanEval JSONL file")
+    parser.add_argument("--context_lengths", type=str, default="1024,2048,4096", help="Comma-separated context lengths for Needle-in-a-Haystack")
     args = parser.parse_args()
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -550,6 +566,9 @@ def main():
     
     # 1. Run Validation Perplexity (PPL)
     val_ppl = evaluate_perplexity(model, val_bin_path="./data/binaries/val.bin", block_size=model_config.block_size, device=device)
+    
+    # 1.1 Run Progressive Perplexity
+    prog_ppl = evaluate_progressive_perplexity(model, val_bin_path="./data/binaries/val.bin", device=device)
 
     # 2. Run Evaluations
     mmlu_acc = evaluate_choices(model, tokenizer, mmlu_samples, "MMLU", device=device)
@@ -580,6 +599,8 @@ def main():
     logger.info("📊 Benchmark Leaderboard & Arena Report:")
     logger.info("-----------------------------------------------------------------------")
     logger.info(f"🏆 Held-out Validation Perplexity (PPL): {val_ppl:.4f}")
+    for k, v in prog_ppl.items():
+        logger.info(f"🏆 Progressive Perplexity ({k}): {v:.4f}")
     logger.info(f"🏆 MMLU Accuracy: {mmlu_acc*100:.2f}%")
     logger.info(f"🏆 GSM8K Accuracy: {gsm_acc*100:.2f}%")
     logger.info(f"🏆 ARC-Challenge Accuracy: {arc_acc*100:.2f}%")
@@ -592,12 +613,14 @@ def main():
     logger.info("=======================================================================")
     
     # 4. Run Needle-in-a-Haystack Evaluator
-    niah_evaluator = NeedleInAHaystackEvaluator()
+    c_lengths = [int(x) for x in args.context_lengths.split(",")]
+    niah_evaluator = NeedleInAHaystackEvaluator(context_lengths=c_lengths)
     niah_results = niah_evaluator.run_eval(model, tokenizer, device=device)
     
     # Save a JSON metric file for our Web Dashboard to read!
     report = {
         "validation_perplexity": val_ppl,
+        "progressive_perplexity": prog_ppl,
         "mmlu_accuracy": mmlu_acc,
         "gsm8k_accuracy": gsm_acc,
         "arc_accuracy": arc_acc,
@@ -617,3 +640,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
