@@ -3,11 +3,71 @@
 import re
 import math
 import logging
+import json
+import asyncio
+import aiohttp
 import torch
 import torch.nn.functional as F
 from utils.sandbox_executor import SandboxCodeExecutor
 
 logger = logging.getLogger(__name__)
+
+async def async_evaluate_single_completion(session, prompt, completion, judge_url="http://localhost:11434/v1/chat/completions"):
+    system_prompt = (
+        "You are an objective judge assessing the quality of assistant responses. "
+        "Review the prompt and the response. Provide an integer score between 1 and 5 "
+        "where 5 is exceptionally correct and clear, and 1 is incorrect or completely unhelpful. "
+        "You must return your output strictly in JSON format as follows: {\"score\": <int>}"
+    )
+    user_content = f"### Prompt:\n{prompt}\n\n### Assistant Response:\n{completion}"
+    
+    payload = {
+        "model": "pump-assistant:latest",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content}
+        ],
+        "temperature": 0.0,
+        "max_tokens": 80,
+        "response_format": {"type": "json_object"}
+    }
+    
+    try:
+        async with session.post(judge_url, json=payload, timeout=30.0) as response:
+            if response.status == 200:
+                res_data = await response.json()
+                content = res_data["choices"][0]["message"]["content"]
+                
+                # Robust regex extraction of score from JSON format (handles reasoning chains output before JSON)
+                score_match = re.search(r'"score"\s*:\s*(\d)', content)
+                if score_match:
+                    return float(score_match.group(1)) / 5.0
+                    
+                # Direct JSON load fallback
+                score_data = json.loads(content)
+                return float(score_data.get("score", 3)) / 5.0
+            else:
+                try:
+                    status_text = await response.text()
+                except Exception:
+                    status_text = "Could not retrieve error text"
+                logger.warning(f"Judge API call returned status {response.status}: {status_text}")
+    except Exception as e:
+        logger.warning(f"Judge API call failed: {type(e).__name__} - {e}")
+    return 0.6  # Default fallback neutral score
+
+async def get_judge_rewards_async(prompts, completions):
+    async with aiohttp.ClientSession() as session:
+        tasks = [async_evaluate_single_completion(session, p, c) for p, c in zip(prompts, completions)]
+        return await asyncio.gather(*tasks)
+
+def get_judge_rewards(prompts, completions):
+    """Synchronous wrapper for integration with GRPO step calculations."""
+    try:
+        return torch.tensor(asyncio.run(get_judge_rewards_async(prompts, completions)), dtype=torch.float32)
+    except Exception as e:
+        logger.error(f"Failed to get LLM judge rewards: {e}")
+        return torch.full((len(completions),), 0.6, dtype=torch.float32)
 
 
 def extract_answer(completion_text: str) -> str:
@@ -57,10 +117,13 @@ def evaluate_completion_rewards(*args, **kwargs):
     if prompts is None:
         prompts = [""] * len(completions)
 
+    # Fetch LLM Judge scores concurrently in one async batch
+    judge_scores = get_judge_rewards(prompts, completions)
+    
     rewards = []
     sandbox = SandboxCodeExecutor(timeout=2.0)
     
-    for prompt, completion, gt in zip(prompts, completions, ground_truths):
+    for idx, (prompt, completion, gt) in enumerate(zip(prompts, completions, ground_truths)):
         reward = 0.0
         
         # A. Format Reward: Reward correct thinking and answer tags
@@ -130,6 +193,34 @@ def evaluate_completion_rewards(*args, **kwargs):
                     consecutive_dups = sum(1 for idx in range(len(lines) - 1) if lines[idx] == lines[idx + 1])
                     if consecutive_dups >= 2:
                         reward -= 1.0  # Penalize duplicate line cycles
+
+            # 4-gram repetition check
+            if len(words) >= 4:
+                grams = [tuple(words[i:i+4]) for i in range(len(words)-3)]
+                unique_grams = set(grams)
+                gram_rep_ratio = 1.0 - (len(unique_grams) / len(grams))
+                if gram_rep_ratio > 0.30:
+                    reward = -1.0  # Force reward to negative baseline for repetitive patterns
+
+            # Thinking chain length constraints: 100~800 is normal; > 1500 or < 20 applies quadratic decay penalty
+            think_tokens = len(words)
+            if think_tokens < 20:
+                reward -= 0.5 * ((20.0 - think_tokens) / 20.0) ** 2
+            elif think_tokens > 1500:
+                reward -= 1.5 * ((think_tokens - 1500.0) / 500.0) ** 2
+
+            # Sentence loop check (3 consecutive sentences with similarity > 0.95)
+            sentences = [s.strip() for s in re.split(r'[.!?。！？\n]', think_text) if s.strip()]
+            if len(sentences) >= 3:
+                for i in range(len(sentences) - 2):
+                    s1, s2, s3 = sentences[i], sentences[i+1], sentences[i+2]
+                    w1, w2, w3 = set(s1.lower().split()), set(s2.lower().split()), set(s3.lower().split())
+                    if w1 and w2 and w3:
+                        sim12 = len(w1.intersection(w2)) / len(w1.union(w2))
+                        sim23 = len(w2.intersection(w3)) / len(w2.union(w3))
+                        if sim12 > 0.95 and sim23 > 0.95:
+                            reward = -1.5  # Force negative score for looping
+                            break
                         
             # F. Visual Multimodal Reasoning Reward
             if any(w in prompt.lower() for w in ["image", "chart", "graph", "screenshot", "picture", "figure", "look"]):
@@ -138,6 +229,10 @@ def evaluate_completion_rewards(*args, **kwargs):
                 if hits >= 2:
                     reward += 0.5  # Reward visual descriptor utilization
                         
+        # G. Add LLM-as-a-Judge Reward (scale normalized [0.2, 1.0] to [0.4, 2.0])
+        judge_score = judge_scores[idx].item()
+        reward += judge_score * 2.0
+        
         rewards.append(reward)
         
     rewards_tensor = torch.tensor(rewards, dtype=torch.float32)

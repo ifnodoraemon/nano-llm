@@ -162,8 +162,8 @@ def train():
     
     # Instantiate models
     # Policy model (Trainable)
-    policy_model = Transformer(config).to(device)
-    policy_model.load_state_dict(state_dict)
+    raw_policy_model = Transformer(config).to(device)
+    raw_policy_model.load_state_dict(state_dict)
     
     # Reference model (Frozen baseline anchor)
     ref_model = Transformer(config).to(device)
@@ -173,16 +173,22 @@ def train():
         param.requires_grad = False
         
     if use_ddp:
-        policy_model = DDP(policy_model, device_ids=[ddp_local_rank], output_device=ddp_local_rank)
+        policy_model = DDP(raw_policy_model, device_ids=[ddp_local_rank], output_device=ddp_local_rank, gradient_as_bucket_view=True, static_graph=False)
+    else:
+        policy_model = raw_policy_model
+        
+    # Enable compile on policy model to maximize GRPO step efficiency
+    logger.info("🔥 Enabling PyTorch Inductor compilation (torch.compile) for GRPO Policy...")
+    compiled_policy_model = torch.compile(policy_model)
         
     # Optimizer Fused AdamW
-    optim_groups = [p for p in policy_model.parameters() if p.requires_grad]
+    optim_groups = [p for p in compiled_policy_model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(optim_groups, lr=args.max_lr, weight_decay=0.01, fused=True)
 
     # Auto-detect checkpoint to self-heal and hot-restore on failure
     has_ckpt, restored_step, restored_epoch = restore_mgr.auto_detect_checkpoint()
     if has_ckpt:
-        restored_step, restored_epoch, _ = restore_mgr.restore_training_state(policy_model, optimizer)
+        restored_step, restored_epoch, _ = restore_mgr.restore_training_state(compiled_policy_model, optimizer)
 
     # Loader setup
     dataset = GRPODataset(args.data_path, tokenizer, max_prompt_length=args.max_prompt_len)
@@ -242,9 +248,11 @@ def train():
             if sampler:
                 sampler.set_epoch(epoch)
 
-            policy_model.train()
+            compiled_policy_model.train()
+            optimizer.zero_grad()
             for batch in loader:
-                optimizer.zero_grad()
+                if use_ddp:
+                    compiled_policy_model.require_backward_grad_sync = (step_idx + 1) % args.grad_accum_steps == 0
 
                 prompt_texts = batch["prompt_texts"]
                 prompt_ids = batch["prompt_ids"].to(device)
@@ -268,6 +276,9 @@ def train():
                     # Apply online Evol-Instruct prompt mutation with 50% probability
                     if random.random() < 0.5:
                         p_text = evol_engine.mutate(p_text)
+                        # Re-tokenize mutated prompt to update p_ids
+                        p_ids_dict = tokenizer(p_text, return_tensors="pt")
+                        p_ids = p_ids_dict["input_ids"].to(device)
 
                     # Replicate prompt ids G times (Group size replication)
                     # G_prompt_ids shape: [G, prompt_len]
@@ -282,7 +293,7 @@ def train():
                     # 1. Rollout: Sample G completions from current policy model
                     # full_seqs shape: [G, prompt_len + max_gen_len]
                     full_seqs, gen_mask = generate_completions(
-                        model=policy_model.module if use_ddp else policy_model, 
+                        model=raw_policy_model, 
                         prompt_ids=G_prompt_ids,
                         pixel_values=p_val,
                         max_gen_len=args.max_gen_len,
@@ -323,8 +334,8 @@ def train():
 
                     # 4. Compute Log Probabilities under Old/Reference Model & Current Policy Model
                     # In GRPO, we sample using policy_model and compute active forward logits
-                    policy_model.train()
-                    policy_logits, _, _ = policy_model(full_seqs, pixel_values=p_val)
+                    compiled_policy_model.train()
+                    policy_logits, _, _ = compiled_policy_model(full_seqs, pixel_values=p_val)
                     policy_logprobs = compute_action_logprobs(policy_logits, full_seqs, gen_mask)
 
                     with torch.no_grad():
@@ -360,7 +371,7 @@ def train():
 
                 # Gradient clipping and optimizer step
                 if (step_idx + 1) % args.grad_accum_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(policy_model.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(compiled_policy_model.parameters(), max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad()
 
@@ -390,7 +401,7 @@ def train():
                             monitor.print_dashboard()
                             
                             avg_len, accuracy, compile_rate = run_online_evaluation(
-                                model=policy_model.module if use_ddp else policy_model,
+                                model=raw_policy_model,
                                 dataloader=val_loader,
                                 tokenizer=tokenizer,
                                 device=device,
@@ -418,7 +429,7 @@ def train():
                         # Non-blocking asynchronous checkpoint and manifest update every 50 steps
                         if (step_idx + 1) % 50 == 0:
                             saver.save_checkpoint(
-                                model=policy_model,
+                                model=compiled_policy_model,
                                 optimizer=optimizer,
                                 lr_scheduler=None,
                                 config=config,
@@ -437,7 +448,7 @@ def train():
                 logger.info(f"Epoch {epoch + 1} training complete. Saving policy model...")
                 checkpoint_out = {
                     "config": config,
-                    "model": policy_model.module.state_dict() if use_ddp else policy_model.state_dict()
+                    "model": raw_policy_model.state_dict()
                 }
                 main_path = os.path.join(args.output_dir, f"checkpoint_grpo_epoch_{epoch+1}.pt")
                 timestamped_path = os.path.join(args.output_dir, f"checkpoint_grpo_epoch_{epoch+1}_{timestamp}.pt")

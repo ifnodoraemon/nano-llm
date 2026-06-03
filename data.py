@@ -96,9 +96,10 @@ class SequencePackingCollator:
     of length `max_length` to prevent waste on pad tokens.
     Generates customized position_ids that reset at sequence boundaries.
     """
-    def __init__(self, pad_token_id: int, max_length: int = 4096):
+    def __init__(self, pad_token_id: int, max_length: int = 4096, batch_size: Optional[int] = None):
         self.pad_token_id = pad_token_id
         self.max_length = max_length
+        self.batch_size = batch_size
 
     def __call__(self, samples: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         batch_input_ids = []
@@ -161,6 +162,21 @@ class SequencePackingCollator:
             batch_position_ids.append(torch.tensor(curr_position_ids, dtype=torch.long))
             batch_seqlens.append(curr_seqlens)
             
+        # Static shape padding or truncation to prevent torch.compile recompilations
+        if self.batch_size is not None:
+            if len(batch_input_ids) > self.batch_size:
+                batch_input_ids = batch_input_ids[:self.batch_size]
+                batch_labels = batch_labels[:self.batch_size]
+                batch_position_ids = batch_position_ids[:self.batch_size]
+                batch_seqlens = batch_seqlens[:self.batch_size]
+            elif len(batch_input_ids) < self.batch_size:
+                needed = self.batch_size - len(batch_input_ids)
+                for _ in range(needed):
+                    batch_input_ids.append(torch.full((self.max_length,), self.pad_token_id, dtype=torch.long))
+                    batch_labels.append(torch.full((self.max_length,), -100, dtype=torch.long))
+                    batch_position_ids.append(torch.zeros(self.max_length, dtype=torch.long))
+                    batch_seqlens.append([self.max_length])
+
         return {
             "input_ids": torch.stack(batch_input_ids),
             "labels": torch.stack(batch_labels),

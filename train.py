@@ -139,7 +139,11 @@ def train():
     dataset = SFTDataset(data_path=args.data_path, tokenizer=tokenizer, max_length=args.max_length)
     validate_dataset(dataset, tokenizer=tokenizer, name="SFT training dataset")
     
-    collator = SequencePackingCollator(pad_token_id=tokenizer.pad_token_id, max_length=args.max_length)
+    collator = SequencePackingCollator(
+        pad_token_id=tokenizer.pad_token_id,
+        max_length=args.max_length,
+        batch_size=args.batch_size
+    )
 
     # Split dataset into train and validation sets (90% train, 10% val)
     val_size = int(0.1 * len(dataset))
@@ -151,9 +155,13 @@ def train():
     train_sampler = DistributedSampler(train_dataset, num_replicas=ddp_world_size, rank=ddp_rank, shuffle=True) if ddp else None
     val_sampler = DistributedSampler(val_dataset, num_replicas=ddp_world_size, rank=ddp_rank, shuffle=False) if ddp else None
 
+    # Enlarge DataLoader micro-batch size by 6x to ensure collator gets enough samples to pack fully
+    dataloader_batch_size = args.batch_size * 6
+    val_dataloader_batch_size = args.batch_size * 6
+
     dataloader = DataLoader(
         train_dataset, 
-        batch_size=args.batch_size, 
+        batch_size=dataloader_batch_size, 
         sampler=train_sampler, 
         shuffle=(train_sampler is None),
         collate_fn=collator,
@@ -161,13 +169,13 @@ def train():
     )
     val_dataloader = DataLoader(
         val_dataset, 
-        batch_size=args.batch_size, 
+        batch_size=val_dataloader_batch_size, 
         sampler=val_sampler, 
         shuffle=False,
         collate_fn=collator,
         pin_memory=True
     )
-    assert_grad_accum_safe(dataloader, args.grad_accum_steps, args.batch_size)
+    assert_grad_accum_safe(dataloader, args.grad_accum_steps, dataloader_batch_size)
 
     # 3. Load Modern LLaMA Model with custom LoRA configurations
     logger.info("Assembling custom LLaMA Transformer architecture...")
@@ -180,6 +188,7 @@ def train():
     if os.path.exists(base_checkpoint_path):
         logger.info(f"Found base pre-trained checkpoint at {base_checkpoint_path}. Loading configuration and weights...")
         model_config, state_dict = load_checkpoint_with_fp8_translation(base_checkpoint_path, map_location=device)
+        model_config.use_checkpoint = True  # Enable memory-saving activation checkpointing!
         model = Transformer(model_config).to(device)
         model.load_state_dict(state_dict)
         has_ckpt = True
@@ -192,6 +201,7 @@ def train():
             lora_r=args.lora_r if args.use_lora else 0,
             lora_alpha=args.lora_alpha
         )
+        model_config.use_checkpoint = True  # Enable memory-saving activation checkpointing!
         model = Transformer(model_config).to(device)
     
     # If use_lora is active, freeze base layer parameters before creating optimizer
@@ -203,9 +213,14 @@ def train():
     param_report = count_parameters(model)
     logger.info(f"Model Parameters: {param_report['total_params']:,} total | {param_report['trainable_params']:,} trainable ({param_report['percentage_trainable']:.2f}% active)")
 
-    # Wrap model in standard DDP
+    # Wrap model in standard DDP with high-performance parameters
     if ddp:
-        model = DDP(model, device_ids=[ddp_local_rank], output_device=ddp_local_rank)
+        model = DDP(model, device_ids=[ddp_local_rank], output_device=ddp_local_rank, gradient_as_bucket_view=True, static_graph=False)
+
+    # Enable compile on policies to maximize forward/backward arithmetic intensity
+    # Since model is now trace-safe and graph-break-free, this provides a massive speedup!
+    logger.info("🔥 Enabling PyTorch Inductor compilation (torch.compile) for SFT...")
+    model = torch.compile(model)
 
     # 4. Optimizer & Scaling Setup
     optimizer = configure_optimizers(
@@ -245,8 +260,8 @@ def train():
     
     try:
         for epoch in range(args.epochs):
-            if sampler is not None:
-                sampler.set_epoch(epoch)
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
 
             model.train()
             epoch_loss = 0.0

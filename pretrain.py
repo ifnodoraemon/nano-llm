@@ -1,4 +1,8 @@
 import os
+# Inject high-performance environment variables before PyTorch initializes
+os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+os.environ["TORCHINDUCTOR_AUTOTUNE_MAX"] = "1"
+
 import time
 import math
 import argparse
@@ -150,16 +154,22 @@ def main():
     def get_batch(split, batch_size=None):
         data = train_data if split == "train" else val_data
         bs = batch_size if batch_size is not None else args.batch_size
-        # Select random starting token indexes
-        ix = torch.randint(len(data) - args.block_size - 1, (bs,))
-        x = torch.stack([torch.from_numpy((data[i : i + args.block_size]).astype(np.int64)) for i in ix])
-        y = torch.stack([torch.from_numpy((data[i + 1 : i + 1 + args.block_size]).astype(np.int64)) for i in ix])
+        
+        # Vectorized generation of starting offsets in NumPy for speed
+        ix = np.random.randint(0, len(data) - args.block_size - 1, size=(bs,))
+        
+        # Batch slice fast numpy array stack and convert to int32 (saving 50% PCIe host bandwidth vs int64)
+        x_np = np.stack([data[i : i + args.block_size] for i in ix]).astype(np.int32)
+        y_np = np.stack([data[i + 1 : i + 1 + args.block_size] for i in ix]).astype(np.int32)
+        
+        x = torch.from_numpy(x_np)
+        y = torch.from_numpy(y_np)
 
-        # Pin memory for high-throughput GPU transfer
+        # Pin memory for low latency GPU transfers, casting to long on GPU to satisfy cross_entropy requirements
         if "cuda" in device:
-            x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+            x, y = x.pin_memory().to(device, non_blocking=True).long(), y.pin_memory().to(device, non_blocking=True).long()
         else:
-            x, y = x.to(device), y.to(device)
+            x, y = x.to(device).long(), y.to(device).long()
         return x, y
 
     # 2b. Optional multi-domain data mixing via DynamicDataMixer
@@ -237,10 +247,9 @@ def main():
 
     model.to(device)
 
-    # 4b. JIT compilation optimization via torch.compile
     if args.use_compile.lower() == "true":
         if master_process:
-            logger.info("🔥 Enabling PyTorch Inductor compilation (torch.compile)...")
+            logger.info("🔥 Enabling PyTorch Inductor compilation (torch.compile) with default mode...")
         model = torch.compile(model)
 
     # Log trainable parameter count
@@ -276,13 +285,13 @@ def main():
         scheduler = OneFOneBScheduler(stage, num_microbatches=args.grad_accum_steps, d_model=config.n_embd)
         
         if ddp and dp_size > 1:
-            stage = DDP(stage, device_ids=[ddp_local_rank], process_group=dp_group)
+            stage = DDP(stage, device_ids=[ddp_local_rank], process_group=dp_group, gradient_as_bucket_view=True, static_graph=False)
         model_to_opt = stage
     else:
         stage = None
         scheduler = None
         if ddp and dp_size > 1:
-            model = DDP(model, device_ids=[ddp_local_rank], process_group=dp_group)
+            model = DDP(model, device_ids=[ddp_local_rank], process_group=dp_group, gradient_as_bucket_view=True, static_graph=False)
         model_to_opt = model
 
     # Auto-detect checkpoint to self-heal and hot-restore on failure
@@ -290,7 +299,22 @@ def main():
     if has_ckpt:
         restored_step, _, _ = restore_mgr.restore_training_state(model, optimizer)
 
-
+    @torch.no_grad()
+    def evaluate_val_loss():
+        model.eval()
+        losses = []
+        for _ in range(30):
+            x_val, y_val = get_batch("val")
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                _, loss, _ = model(x_val, targets=y_val)
+            losses.append(loss.item())
+        mean_loss = sum(losses) / len(losses)
+        if ddp:
+            loss_tensor = torch.tensor(mean_loss, device=device)
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            mean_loss = (loss_tensor / ddp_world_size).item()
+        model.train()
+        return mean_loss
 
     # 7. Pre-training Optimization Loop
     model.train()
@@ -319,6 +343,27 @@ def main():
             "total_params": n_params, "batch_size": args.batch_size,
             "block_size": args.block_size, "max_steps": args.max_steps,
         })
+
+    class DataPrefetcher:
+        def __init__(self, get_batch_fn, split, grad_accum_steps):
+            self.get_batch_fn = get_batch_fn
+            self.split = split
+            self.grad_accum_steps = grad_accum_steps
+            self.stream = torch.cuda.Stream()
+            self.next_batches = []
+            self.preload()
+
+        def preload(self):
+            with torch.cuda.stream(self.stream):
+                self.next_batches = [self.get_batch_fn(self.split) for _ in range(self.grad_accum_steps)]
+
+        def next(self):
+            torch.cuda.current_stream().wait_stream(self.stream)
+            batches = self.next_batches
+            self.preload()
+            return batches
+
+    prefetcher = DataPrefetcher(get_batch, "train", args.grad_accum_steps)
 
     try:
         while step < args.max_steps:
@@ -350,22 +395,33 @@ def main():
 
                 loss_accum = sum(l.detach().item() for l in losses) / args.grad_accum_steps if losses else 0.0
             else:
-                for micro_step in range(args.grad_accum_steps):
-                    x, y = get_batch("train")
-
-                    # Disable DDP gradient sync on intermediate micro-steps
-                    if ddp:
-                        model.require_backward_grad_sync = (micro_step == args.grad_accum_steps - 1)
-
-                    # Forward pass under native bfloat16 AMP
+                batches = prefetcher.next()
+                if ddp and args.grad_accum_steps > 1:
+                    # Pre-N-1 steps: use model.no_sync() to strictly avoid any DDP communications hooks
+                    for micro_step in range(args.grad_accum_steps - 1):
+                        x, y = batches[micro_step]
+                        with model.no_sync():
+                            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                                logits, loss, _ = model(x, targets=y)
+                                loss = loss / args.grad_accum_steps
+                            loss_accum += loss.detach().item()
+                            loss.backward()
+                    
+                    # Final step: run outside no_sync to trigger All-Reduce gradient synchronization
+                    x, y = batches[-1]
                     with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
                         logits, loss, _ = model(x, targets=y)
                         loss = loss / args.grad_accum_steps
-
                     loss_accum += loss.detach().item()
-
-                    # Backward pass
                     loss.backward()
+                else:
+                    for micro_step in range(args.grad_accum_steps):
+                        x, y = batches[micro_step]
+                        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            logits, loss, _ = model(x, targets=y)
+                            loss = loss / args.grad_accum_steps
+                        loss_accum += loss.detach().item()
+                        loss.backward()
 
             # Clip global gradient norm
             if args.grad_clip > 0.0:
@@ -389,13 +445,22 @@ def main():
             )
             mfu_percentage = min(100.0, max(0.0, mfu_percentage))
 
+            # Run validation loss evaluation on all ranks if we hit the interval
+            val_loss = None
+            if (step + 1) % 500 == 0:
+                val_loss = evaluate_val_loss()
+
             if master_process:
-                tracker.log({
+                log_data = {
                     "pretrain/loss": loss_accum,
                     "pretrain/lr": lr,
                     "pretrain/mfu": mfu_percentage,
                     "pretrain/step_time_ms": dt * 1000,
-                }, step=step)
+                }
+                if val_loss is not None:
+                    log_data["pretrain/val_loss"] = val_loss
+                    logger.info(f"📊 Validation Step {step+1} | Val Loss: {val_loss:.4f}")
+                tracker.log(log_data, step=step)
                 telemetry_str = monitor.get_formatted_telemetry()
                 logger.info(
                     f"Step {step+1}/{args.max_steps} | "
@@ -406,8 +471,8 @@ def main():
                     f"{telemetry_str}"
                 )
 
-                # Print detailed ASCII telemetry cockpit every 50 steps
-                if (step + 1) % 50 == 0:
+                # Print detailed ASCII telemetry cockpit every 500 steps
+                if (step + 1) % 500 == 0:
                     monitor.print_dashboard()
 
                 # Write structured JSON to stdout so FastAPI server captures step metrics
@@ -419,8 +484,8 @@ def main():
                 with open("outputs/system_telemetry.json", "w") as f:
                     json.dump(monitor.get_telemetry_report(), f, indent=2)
 
-                # Non-blocking asynchronous checkpoint and manifest update every 50 steps
-                if (step + 1) % 50 == 0:
+                # Non-blocking asynchronous checkpoint and manifest update every 500 steps
+                if (step + 1) % 500 == 0:
                     saver.save_checkpoint(
                         model=model,
                         optimizer=optimizer,

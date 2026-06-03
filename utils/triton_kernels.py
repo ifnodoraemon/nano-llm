@@ -223,25 +223,45 @@ def triton_mla_flash_attn(
 ) -> torch.Tensor:
     """
     Triton-accelerated / JIT compiled MLA attention kernel wrapper.
-    Leverages FlashAttention-3 emulator with FP8 custom block-scaling if available,
-    otherwise falls back to JIT compiled native PyTorch scaled dot-product attention.
+    Leverages PyTorch native scaled dot-product attention (FlashAttention/Memory-Efficient Attention)
+    to prevent CUDA Out of Memory errors, while maintaining optional simulated FP8 block scaling.
     """
-    # Simply delegate to the FP8FlashAttention3 compiled class for extreme JIT performance
-    from utils.triton_fa3 import FP8FlashAttention3
-    
-    # Pre-scale attention scale
-    scaled_multiplier = attn_scale_multiplier
-    
-    # Instantiate or run
-    fa3 = FP8FlashAttention3(head_dim=q.size(-1))
-    
     # We transpose q, k, v to match [Batch, Num_heads, Seq_len, Head_dim] format
-    # which FP8FlashAttention3 expects
+    # which scaled_dot_product_attention expects: [B, H, L, D]
     q_ = q.transpose(1, 2)
     k_ = k.transpose(1, 2)
     v_ = v.transpose(1, 2)
     
-    out_ = fa3(q_, k_, v_, attn_scale_multiplier=scaled_multiplier)
-    
+    # Check if inputs are in CUDA to apply native SDPA (which requires CUDA)
+    if q_.is_cuda:
+        # Simulate FP8 quantization noise to match Hopper hardware behavior if needed
+        # Q/K/V scaling ranges
+        q_scale = 1.0 / (q_.abs().max() + 1e-5)
+        k_scale = 1.0 / (q_scale if k_ is q_ else (k_.abs().max() + 1e-5)) # k_ is sometimes Q in self-attention query
+        v_scale = 1.0 / (v_.abs().max() + 1e-5)
+        
+        # Cast to float8_e4m3fn and back to simulate quantization loss
+        q_sim = (q_ * q_scale).to(dtype=torch.float8_e4m3fn).to(dtype=q_.dtype) * (1.0 / q_scale)
+        k_sim = (k_ * k_scale).to(dtype=torch.float8_e4m3fn).to(dtype=k_.dtype) * (1.0 / k_scale)
+        v_sim = (v_ * v_scale).to(dtype=torch.float8_e4m3fn).to(dtype=v_.dtype) * (1.0 / v_scale)
+        
+        # Fused SDPA (which runs real FlashAttention C++ kernel in PyTorch)
+        out_ = F.scaled_dot_product_attention(
+            q_sim, k_sim, v_sim,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True,
+            scale=scale * attn_scale_multiplier
+        )
+    else:
+        # CPU Fallback
+        out_ = F.scaled_dot_product_attention(
+            q_, k_, v_,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True,
+            scale=scale * attn_scale_multiplier
+        )
+        
     # Transpose back to [Batch, Seq_len, Num_heads, Head_dim] and return
     return out_.transpose(1, 2).contiguous()

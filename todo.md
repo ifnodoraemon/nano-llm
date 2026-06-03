@@ -6,10 +6,11 @@
 
 ## 🎯 1. 预训练阶段 (Pre-training Gaps & Innovations)
 
-### 1.1 监控 1.5B 预训练收敛 (P0 - 正在运行)
-*   **任务 ID**：`task-2212` (目标 5000 步，当前进度 755+)。
-*   **状态**：已解决 NVML 锁问题，单步耗时稳定在 **4.2 秒**，Loss 在 5.5 左右，收敛正常。
-*   **待办**：持续跟进 Loss 收敛趋势与梯度稳定性，预计在 2026-06-01 23:50 完成。
+### 1.1 监控 2B-dense 预训练收敛 (P0 - 正在运行)
+*   **任务 ID**：`task-3567` (目标 2000 步，当前进度 353/2000)。
+*   **模型**：2B-dense (36 layers, 32 heads, embed 2048)，8×H800 DDP，`block_size=4096`。
+*   **状态**：Loss 已降至 **4.05**，MFU 峰值 100%（含 JIT 编译抖动），`lr=5.77e-4`，收敛非常健康。
+*   **待办**：持续跟进 Loss 收敛趋势与梯度稳定性，预计约 5 小时后完成全部 2000 步。
 
 ### 1.2 修复 MFU (Model FLOPs Utilization) 计算错误 (P0 - 立即修复)
 *   **问题**：[pretrain.py](file:///home/ifnodoraemon/myagent/nano-llm/pretrain.py#L374) 在计算 `mfu_percentage` 时，直接将集群总 FLOPs/sec 除以了单卡 H800 的峰值性能 (`312e12`)，导致算出的 MFU 偏大 `ddp_world_size` (8) 倍。
@@ -191,3 +192,131 @@
 ### 6.3 更强 (Stronger) —— 视觉多模态与系统鲁棒性
 *   **多模态视觉能力解锁 (VLM)**：将配置中的 `vision_dim`（目前预留了 `1152`）与 SigLIP 等预训练视觉编码器对齐。通过双阶段对齐（Projector 对齐 -> 图像-文本联合微调），将基座升级为具备高保真图文理解力的多模态模型，对标 DeepSeek-VL。
 *   **DoRA 无损微调支持**：支持权重分解低秩适应（DoRA），为下游垂直行业提供更强、更稳定的参数高效微调。
+
+---
+
+## 🛠️ 7. 基础设施与工程化缺口 (Infrastructure & Engineering Gaps)
+
+> 以下项来源于 2026-06-02 的全项目自动化审计，是现有 todo 中尚未覆盖的工程维度缺口。
+
+### 7.1 依赖清单补全 (P1 - 立即修复)
+*   **问题**：[requirements.txt](file:///home/ifnodoraemon/myagent/nano-llm/requirements.txt) 缺少多个运行时必需依赖，会导致在干净环境中 `pip install -r requirements.txt` 后无法启动。
+*   **缺失项**：
+    *   `safetensors` — `export_dora.py` 和 `quantize.py` 必需
+    *   `numpy` — 全项目通用，但仅在 `pyproject.toml` 中声明
+    *   `datasets` — 数据下载脚本 (`download_pretrain_corpus.py` 等) 必需
+    *   `Pillow` — 多模态视觉管线必需
+    *   `aiohttp` — GRPO LLM Judge 异步调用必需
+*   **待办**：统一 `requirements.txt` 与 `pyproject.toml`，确保两份依赖清单严格同步。
+
+### 7.2 GGUF / ONNX 模型导出支持 (P2)
+*   **问题**：当前模型导出仅支持 HuggingFace safetensors ([convert.py](file:///home/ifnodoraemon/myagent/nano-llm/convert.py)) 和 PyTorch `.pt` 格式。缺少社区广泛使用的 **GGUF** (llama.cpp) 和 **ONNX** 导出路径，限制了模型在边缘设备和 CPU 推理场景的部署能力。
+*   **待办**：
+    *   实现 `export_gguf.py`：将模型权重转换为 llama.cpp 兼容的 GGUF 格式（含 Q4_K_M / Q5_K_M 量化变体）。
+    *   实现 `export_onnx.py`：使用 `torch.onnx.export` 导出含 KV-cache 的 ONNX 图，支持 ONNX Runtime 推理。
+
+### 7.3 自动化阶段间评测触发器 (Automated Inter-Stage Evaluation) (P1)
+*   **问题**：目前每个阶段（预训练 → SFT → DPO → GRPO）完成后需要**手动**运行 `eval_benchmarks.py`。在长时间无人值守训练中，可能错过关键的能力退化信号。
+*   **待办**：
+    *   在 [pretrain.py](file:///home/ifnodoraemon/myagent/nano-llm/pretrain.py)、[train.py](file:///home/ifnodoraemon/myagent/nano-llm/train.py)、[align.py](file:///home/ifnodoraemon/myagent/nano-llm/align.py)、[grpo.py](file:///home/ifnodoraemon/myagent/nano-llm/grpo.py) 的训练循环末尾，加入自动调用 `eval_benchmarks.py` 的 hook。
+    *   将评测结果自动追加到 `ExperimentTracker` 并写入 `outputs/eval_report.json`，支持阶段间 diff 对比。
+    *   可选：在 eval score 低于预设阈值时，自动发送告警（如写入日志 ALERT 或触发 webhook）。
+
+### 7.4 Web Dashboard REST API 流式输出修复 (P1)
+*   **问题**：[web/server.py](file:///home/ifnodoraemon/myagent/nano-llm/web/server.py) 中 `/api/chat` 端点目前是 **mock 逻辑**，返回模拟数据而非真实模型推理结果。
+*   **待办**：
+    *   替换为真实的 **Server-Sent Events (SSE)** 流式协议，对接 `serve/generation.py` 的 token-by-token 生成。
+    *   支持 HuggingFace `TextStreamer` 适配器，实现字级流式输出。
+    *   增加 `/api/models` 端点用于列出可用的模型 checkpoint。
+
+### 7.5 多模态 VLM 假数据占位符替换 (P2)
+*   **问题**：[data.py](file:///home/ifnodoraemon/myagent/nano-llm/data.py) 第 325 行附近，`MultimodalSFTDataset` 使用 `torch.randn(3, 384, 384)` 生成随机像素张量作为 `pixel_values`，而非加载真实图像。这导致 VLM 训练完全无法学到真实的视觉-语言对齐。
+*   **待办**：
+    *   将 `pixel_values` 替换为通过 `PIL.Image.open()` 加载真实图像并经 SigLIP 预处理器归一化后的张量。
+    *   在数据集格式中增加 `"image_path"` 字段，实现图文绑定。
+
+### 7.6 自定义 BPE Tokenizer 扩容 (P2)
+*   **问题**：[train_tokenizer.py](file:///home/ifnodoraemon/myagent/nano-llm/train_tokenizer.py) 默认 `vocab_size=1500`，远小于生产级模型通常使用的 32K~128K 词表。当前 tokenizer 仅适合开发验证。
+*   **待办**：
+    *   将默认 `vocab_size` 提升至 `32000` 或 `65536`。
+    *   在训练语料中混入中英文平衡语料、代码片段、数学公式，确保多语言覆盖度。
+    *   增加 byte-level fallback 以杜绝 UNK token。
+
+---
+
+## 🛡️ 8. 模型质量诊断与安全护栏 (Quality Diagnostics & Safety Guardrails)
+
+> 以下协议从 [sft_and_grpo_implementation_plan.md](file:///home/ifnodoraemon/.gemini/antigravity-cli/brain/001fe77d-5c32-4061-bdac-6a0d021fe527/sft_and_grpo_implementation_plan.md) §5 同步至项目 TODO，确保不遗漏。
+
+### 8.1 预训练→后训练归因诊断矩阵 (P0 - 贯穿全流程)
+*   **核心原则**："智商不够找预训练，没规矩找后训练"。
+*   **执行**：每个阶段 checkpoint 保存后，自动运行 `eval_benchmarks.py`，按以下矩阵归因：
+
+| 症状 | 主要指标 | 高分 → 无问题 | 低分 → 归因与行动 |
+| :--- | :--- | :--- | :--- |
+| 事实知识不足 | MMLU / ARC / PPL | 基座表征丰富 | **预训练问题**：清洗数据 / 扩大语料 |
+| 数学推理弱 | GSM8K (step-by-step) | 基座具备数学能力 | **预训练问题**：数学语料不足 |
+| `<think>` 推理不自主触发 | GSM8K (zero-shot) | GRPO 成功激活思考 | **后训练问题**：GRPO 奖励函数过弱 |
+| 代码能力弱 | HumanEval Pass@1 | 编码结构安全 | **预训练/SFT 问题**：代码语料不足或 SFT 数据脏 |
+| 指令遵从差 / 安全拒答异常 | Elo Arena Win-rate | 对齐成功 | **后训练问题**：Prompt masking 失败 / 安全数据过拒 |
+
+### 8.2 安全红队与过载拒答率检测 (Safety Red-Teaming) (P1)
+*   **目标**：漏过率 (Under-Refusal) $< 1\%$，误拒率 (Over-Refusal) $< 5\%$。
+*   **待办**：在 `eval_benchmarks.py` 中引入：
+    *   **恶意攻击集**：100+ 条红队 prompt（写木马、制造武器等），测试 100% 拒绝率。
+    *   **安全边缘集**：100+ 条听起来敏感但实际无害的 prompt（如"如何写红绿灯控制代码"），测试误拒率。
+
+### 8.3 GRPO 奖励作弊与思维链退化监控 (Reward Hacking Monitor) (P0)
+*   **待办**：在 [grpo/rewards.py](file:///home/ifnodoraemon/myagent/nano-llm/grpo/rewards.py) 中增加：
+    *   **n-gram 重复率检测**：`<think>` 内 4-gram 重复率 $> 30\%$ 时，强制 Reward 为负（$-1.0$）。
+    *   **思维链长度硬约束**：100~800 tokens 正常；$> 1500$ tokens 或 $< 20$ tokens 施加二次衰减惩罚。
+    *   **死循环检测**：检测连续 3 句语义相似度 $> 0.95$ 的重复句式，直接截断并判负分。
+
+### 8.4 测试集数据污染自检 (Data Contamination Detector) (P1)
+*   **待办**：
+    *   实现 `scripts/detect_contamination.py`：对训练集与评测集进行 **3-gram 重合度过滤**。
+    *   重合度 $> 70\%$ 的训练样本自动从训练集中剔除。
+    *   在每次数据更新后自动运行，输出污染报告至 `outputs/contamination_report.json`。
+
+### 8.5 集群硬件稳定性压力测试 (Cluster Burn-in Test) (P2)
+*   **待办**：编写 `scripts/cluster_burnin.py`：
+    *   在 8×H800 上运行 30 分钟的 NCCL all-reduce 压力测试。
+    *   监控 GPU 温度、显存使用、互联带宽的波动。
+    *   生成稳定性报告，标记热节流或掉卡风险。
+
+---
+
+## 🔬 9. 核心算法与推理库深层缺陷 (Core Algorithmic & Serving Gaps)
+
+### 9.1 Evol-Instruct 提示词变异与 Tokenization 严重不一致 bug (P0 - 立即修复)
+*   **问题**：在 [grpo.py](file:///home/ifnodoraemon/myagent/nano-llm/grpo.py#L272-L278) 中，为了增加强化学习提示词的多样性，设置了 50% 概率触发 `evol_engine.mutate(p_text)`。但变异后的 `p_text` 字符串**根本没有被重新 Tokenize 赋值给 `p_ids`**！模型在 Rollout 时依然使用的是变异前原始 prompt token (`p_ids`)，但在计算 Reward 时，[evaluate_completion_rewards](file:///home/ifnodoraemon/myagent/nano-llm/grpo.py#L307) 传入的却是**变异后**的 `p_text`。
+*   **后果**：模型生成的答案是回答原始 prompt 的，但判定 rewards 时系统却误以带有约束条件的变异 prompt 评估，导致奖励大范围“蒙冤被扣”（例如变异增加了 JSON 格式约束，模型没看到这个约束所以返回了普通文本，因此被判 0 分），极大干扰了强化学习对齐收敛。
+*   **待办**：在提示词变异触发后，**必须重新调用 `tokenizer.encode` 将变异文本转为 tokens 覆盖 `p_ids`**，使生成和奖励评估在输入上严格保持一致。
+
+### 9.2 PagedAttention 没有真正接入 Transformer forward 循环 (P1 - 彻底接入)
+*   **问题**：在 [serve/paged_attention.py](file:///home/ifnodoraemon/myagent/nano-llm/serve/paged_attention.py#L65) 中虽然调度并分配了 virtual memory block，但进入模型 forward 调用时直接使用的是常规 `model(x, start_pos)`。在 [model/__init__.py](file:///home/ifnodoraemon/myagent/nano-llm/model/__init__.py) 的 Transformer 和 Attention 前向计算逻辑中，完全没有任何 PagedAttention 虚拟页表参数的接收与算子映射。
+*   **后果**：PagedAttention 模块目前处于“假运行/Mock 挂载”状态，推理实际上走的是 contiguous buffer 的静态 KV 缓存，无法节省碎片显存或支持超大并发连续批处理。
+*   **待办**：
+    *   修改 [model/__init__.py](file:///home/ifnodoraemon/myagent/nano-llm/model/__init__.py) 中的自注意力层，使其可选接收 `block_tables` 参数。
+    *   在解码阶段用 `PagedAttentionKernel` 算子替代默认的 FlashAttention 或 eager attention 计算。
+
+### 9.3 MCTS 推理零 KV-Cache 导致的 $O(N^2)$ 计算瓶颈 (P1)
+*   **问题**：在 [utils/mcts_engine.py](file:///home/ifnodoraemon/myagent/nano-llm/utils/mcts_engine.py#L190-L209) 的 `_generate_step_chunk` 步骤中，每一次生成新的 token，都把整个历史序列 `curr_seq` 传入 `self.model(curr_seq)` 进行完整的 forward pass，并没有使用任何 KV-cache。
+*   **后果**：随着搜索深度和生成长度增加，计算量呈平方级（$O(N^2)$）剧烈膨胀，导致高推理步数（MCTS search）极慢，根本无法在生产环境中推广。
+*   **待办**：重构 `_generate_step_chunk` 以支持 KV-cache 状态保存与复用，使自回归迭代仅需传入当前的单 step token。
+
+### 9.4 密集检索 RAG 使用的是伪随机投影 word-hashing (P2)
+*   **问题**：[utils/rag_retriever.py](file:///home/ifnodoraemon/myagent/nano-llm/utils/rag_retriever.py#L80-L99) 中，`DenseRetriever.fit` 并未真正使用预训练的向量模型（如 HuggingFace embedding），而是使用了 `_deterministic_hash(word) % self.embed_dim` 计算特征，本质上是退化的类似 TF-IDF 的随机投影哈希词袋模型。
+*   **待办**：引入一个轻量级的双塔嵌入模型（例如本地加载预训练的 `bge-small-zh`），提取语义稠密向量计算 cosine similarity，或者直接调用 base model 最后一层的 Hidden State 平均池化来代替随机投影，实现真实的语义检索。
+
+---
+
+## 🔀 10. 模型合并与对齐后处理 (Model Merging & Post-Alignment)
+
+### 10.1 引入大模型合并工具链 (Model Merge Toolkit) (P2)
+*   **背景**：在 SFT、DPO 和 GRPO 完成后，模型通常会在某些垂直能力上发生漂移（如 GRPO 极大强化了数学推理，但日常闲聊和通用对话的 SFT 遵从度可能会有轻微下降，即 Alignment Tax）。大模型合并（Merge）是目前低成本融合多阶段能力的最佳方案。
+*   **待办**：在根目录下编写 `merge_models.py`，支持以下主流大模型合并算法：
+    *   **Linear/Spherical Linear Interpolation (SLERP)**：球形线性插值，适合两个 checkpoint 权重的平滑过度。
+    *   **TIES-Merging (Truncation, Sign Agreement, and Elective Sum)**：修剪冗余微小参数变化，保留方向一致性并融合。
+    *   **DARE (Drop and Rescale)**：通过随机丢弃微调权重增量并按比例放大，减少参数共线性冲突。
+*   **应用**：最终可将 `./outputs/sft_model` 与 `./outputs/grpo_model` 的权重按 `DARE` 融合，提取最强的指令遵从性与最深邃的推理能力。

@@ -59,5 +59,8 @@ def load_checkpoint_with_fp8_translation(
         tried = ", ".join(state_keys)
         raise KeyError(f"Could not locate model state dictionary in checkpoint. Tried keys: {tried}")
 
+    # Strip torch.compile prefix '_orig_mod.' from keys if saved from a compiled model wrapper
+    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+
     state_dict = translate_fp8_keys(state_dict)
     return model_config, state_dict

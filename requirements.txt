@@ -25,4 +25,9 @@ pydantic
 huggingface_hub
 modelscope
 
-
+# Missing dependencies
+numpy
+datasets
+safetensors
+Pillow
+aiohttp

@@ -232,13 +232,15 @@ class CausalSelfAttention(nn.Module):
         # Multiply standard scaling by attn_scale_multiplier to sharpen/soften attention maps
         custom_scale = (1.0 / math.sqrt(self.head_dim)) * self.attn_scale_multiplier
 
-        output = F.scaled_dot_product_attention(
-            xq, xk, xv,
-            attn_mask=mask,
-            dropout_p=0.0,
-            is_causal=True if mask is None and start_pos is None else False,
-            scale=custom_scale
-        )
+        # Force high-efficiency SDPA backends (FlashAttention/Mem-Efficient) and disable Math fallback
+        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
+            output = F.scaled_dot_product_attention(
+                xq, xk, xv,
+                attn_mask=mask,
+                dropout_p=0.0,
+                is_causal=True if mask is None and start_pos is None else False,
+                scale=custom_scale
+            )
 
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
@@ -298,10 +300,14 @@ class Transformer(nn.Module):
         self.norm = RMSNorm(config.n_embd, eps=config.norm_eps)
         self.output = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        self.freqs_cis = precompute_freqs_cis(
-            dim=config.n_embd // config.n_head,
-            end=config.block_size * 2,
-            scaling_factor=config.rope_scaling
+        self.register_buffer(
+            "freqs_cis",
+            precompute_freqs_cis(
+                dim=config.n_embd // config.n_head,
+                end=config.block_size * 2,
+                scaling_factor=config.rope_scaling
+            ),
+            persistent=False
         )
 
         self.apply(self._init_weights)
@@ -370,14 +376,14 @@ class Transformer(nn.Module):
         pos = start_pos if start_pos is not None else 0
         needed_end = pos + total_seqlen
         if needed_end > self.freqs_cis.shape[0]:
-            self.freqs_cis = precompute_freqs_cis(
+            freqs_cis_full = precompute_freqs_cis(
                 dim=self.config.n_embd // self.config.n_head,
                 end=needed_end * 2,
                 scaling_factor=self.config.rope_scaling
-            )
-
-        self.freqs_cis = self.freqs_cis.to(tokens.device)
-        freqs_cis = self.freqs_cis[pos : pos + total_seqlen]
+            ).to(tokens.device)
+            freqs_cis = freqs_cis_full[pos : pos + total_seqlen]
+        else:
+            freqs_cis = self.freqs_cis[pos : pos + total_seqlen].to(tokens.device)
 
         # 3. Autoregressive multi-modal self-attention layers
         total_aux_loss = torch.tensor(0.0, device=h.device)
@@ -416,8 +422,8 @@ class Transformer(nn.Module):
                 targets_padded.view(-1),
                 ignore_index=-100
             )
-            # Add MoE load balancing auxiliary loss
-            if total_aux_loss.item() > 0:
+            # Add MoE load balancing auxiliary loss if MoE is active
+            if getattr(self.config, "use_moe", False):
                 loss = loss + self.config.aux_loss_weight * total_aux_loss
         else:
             if return_all_logits or (start_pos is None and kv_caches is None):
@@ -426,7 +432,7 @@ class Transformer(nn.Module):
                 logits = self.output(h[:, [-1], :])
             loss = None
 
-        return logits, loss, total_aux_loss.detach() if total_aux_loss.item() > 0 else None
+        return logits, loss, (total_aux_loss.detach() if getattr(self.config, "use_moe", False) else None)
 
 
 # ==============================================================================

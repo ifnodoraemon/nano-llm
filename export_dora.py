@@ -7,7 +7,12 @@ from safetensors.torch import save_file
 
 
 def export(checkpoint_path: str = None, dest_dir: str = None):
-    src_pt = checkpoint_path or "./outputs_grpo/checkpoint_grpo_epoch_1.pt"
+    src_pt = checkpoint_path
+    if not src_pt:
+        if os.path.exists("./outputs/checkpoint_pretrain.pt"):
+            src_pt = "./outputs/checkpoint_pretrain.pt"
+        else:
+            src_pt = "./outputs_grpo/checkpoint_grpo_epoch_1.pt"
     dest_dir = dest_dir or "./outputs/dora"
     os.makedirs(dest_dir, exist_ok=True)
 
@@ -15,6 +20,8 @@ def export(checkpoint_path: str = None, dest_dir: str = None):
     checkpoint = torch.load(src_pt, map_location="cpu", weights_only=False)
 
     nano_state = checkpoint.get("model_state_dict", checkpoint.get("model", {}))
+    # Strip torch.compile prefix '_orig_mod.' from keys
+    nano_state = {k.replace("_orig_mod.", ""): v for k, v in nano_state.items()}
     nano_config = checkpoint["config"]
     use_mla = getattr(nano_config, 'use_mla', False)
     use_moe = getattr(nano_config, 'use_moe', False)
@@ -226,7 +233,12 @@ if __name__ == "__main__":
 
     # Optional: generate quantized versions
     if args.quantize:
-        src_ckpt = args.checkpoint_path or "./outputs_grpo/checkpoint_grpo_epoch_1.pt"
+        src_ckpt = args.checkpoint_path
+        if not src_ckpt:
+            if os.path.exists("./outputs/checkpoint_pretrain.pt"):
+                src_ckpt = "./outputs/checkpoint_pretrain.pt"
+            else:
+                src_ckpt = "./outputs_grpo/checkpoint_grpo_epoch_1.pt"
         for bits in [8, 4]:
             _logger.info(f"Generating int{bits} quantized model...")
             try:

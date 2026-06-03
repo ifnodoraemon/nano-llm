@@ -1,6 +1,28 @@
 import os
 import logging
 from typing import Any, Optional
+import requests
+from urllib.parse import urlparse
+
+# ==============================================================================
+# Transparent Hugging Face Mirror Rewriter (Monkeypatch)
+# ==============================================================================
+# In regions where huggingface.co is blocked, huggingface_hub uses HF_ENDPOINT (e.g. hf-mirror.com).
+# However, Hugging Face API pagination uses the HTTP Link header, which returns absolute URLs
+# pointing directly to huggingface.co. To prevent pagination from hanging, we rewrite all
+# requests targeting huggingface.co to use the configured mirror.
+original_request = requests.Session.request
+
+def patched_request(self, method, url, *args, **kwargs):
+    if isinstance(url, str) and "huggingface.co" in url:
+        endpoint = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com").strip()
+        parsed = urlparse(endpoint)
+        domain = parsed.netloc or parsed.path
+        if domain:
+            url = url.replace("huggingface.co", domain)
+    return original_request(self, method, url, *args, **kwargs)
+
+requests.Session.request = patched_request
 
 logger = logging.getLogger(__name__)
 

@@ -224,6 +224,7 @@ MODEL_PRESETS: dict[str, ModelPreset] = {
         n_embd=2048,
         block_size=4096,
         vocab_size=32000,
+        use_mla=True,
     ),
     "2B-dense": ModelPreset(
         name="2B-dense",
@@ -232,6 +233,7 @@ MODEL_PRESETS: dict[str, ModelPreset] = {
         n_embd=2048,
         block_size=4096,
         vocab_size=32000,
+        use_mla=True,
     ),
     "2.7B-dense": ModelPreset(
         name="2.7B-dense",
@@ -240,6 +242,7 @@ MODEL_PRESETS: dict[str, ModelPreset] = {
         n_embd=2560,
         block_size=4096,
         vocab_size=32000,
+        use_mla=True,
     ),
 }
 

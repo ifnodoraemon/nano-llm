@@ -33,8 +33,8 @@ def autotune_nccl():
     
     # Autotuned environment variables mapping
     tuned_vars = {
-        "NCCL_DEBUG": "INFO",
-        "NCCL_DEBUG_SUBSYS": "INIT,COLL,ENV",
+        "NCCL_DEBUG": "WARN",
+        "NCCL_DEBUG_SUBSYS": "INIT",
         "NCCL_BUFFSIZE": "4194304", # Set 4MB socket cache buffer to saturate high bandwidth links
         "OMP_NUM_THREADS": "8"
     }

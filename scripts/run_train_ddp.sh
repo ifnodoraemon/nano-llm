@@ -20,7 +20,7 @@ mkdir -p "$OUTPUT_DIR"
 MODEL_PATH="Qwen/Qwen2.5-7B" 
 
 # Training data path (JSON Lines conversational format)
-DATA_PATH="./data/train_sft.jsonl"
+DATA_PATH="./data/train_sft_premium.jsonl"
 
 echo "======================================================================="
 echo "🚀 Starting Karpathy-Style Distributed SFT Training (Native DDP)"
@@ -38,7 +38,7 @@ torchrun --nnodes=1 --nproc_per_node=8 --master_port=29601 \
     --data_path "$DATA_PATH" \
     --max_length 4096 \
     --epochs 3 \
-    --batch_size 4 \
+    --batch_size 8 \
     --grad_accum_steps 4 \
     --max_lr 2e-5 \
     --min_lr 2e-6 \
