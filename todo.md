@@ -221,11 +221,10 @@
     *   `aiohttp` — GRPO LLM Judge 异步调用必需
 *   **待办**：统一 `requirements.txt` 与 `pyproject.toml`，确保两份依赖清单严格同步。
 
-### 7.2 GGUF / ONNX 模型导出支持 (P2)
-*   **问题**：当前模型导出仅支持 HuggingFace safetensors ([convert.py](file:///home/ifnodoraemon/myagent/nano-llm/convert.py)) 和 PyTorch `.pt` 格式。缺少社区广泛使用的 **GGUF** (llama.cpp) 和 **ONNX** 导出路径，限制了模型在边缘设备和 CPU 推理场景的部署能力。
-*   **待办**：
-    *   实现 `export_gguf.py`：将模型权重转换为 llama.cpp 兼容的 GGUF 格式（含 Q4_K_M / Q5_K_M 量化变体）。
-    *   实现 `export_onnx.py`：使用 `torch.onnx.export` 导出含 KV-cache 的 ONNX 图，支持 ONNX Runtime 推理。
+### 7.2 GGUF / ONNX 模型导出支持 (P2 - ✅ 已完成)
+*   **状态**：已解决。
+    *   实现了 `export_onnx.py`：利用 PyTorch 原生 `torch.onnx.export` 进行导出。针对 ONNX 对复杂/新算子支持弱的问题进行了解构重构，将 RoPE（旋转位置编码）转换为实数 sine/cosine 乘加运算（避开了 `ComplexFloat` 在 ONNX JIT 追踪中的报错），并检测 ONNX 导出状态自动将 `RMSNorm` 降级为基本数学算子，避开了 `aten::rms_norm` 在兼容库中缺失的错误。已在远程 GPU 服务端验证导出成功。
+    *   实现了 `export_gguf.py`：支持先将 nano-llm 模型权重与 config 直接保存为 Hugging Face 标准格式（不实例化模型类以避免 FlashAttention 版本冲突），并提供了自动化及手动的 llama.cpp GGUF 转换接口，支持量化。已在远程服务端验证导出成功。
 
 ### 7.3 自动化阶段间评测触发器 (Automated Inter-Stage Evaluation) (P1)
 *   **问题**：目前每个阶段（预训练 → SFT → DPO → GRPO）完成后需要**手动**运行 `eval_benchmarks.py`。在长时间无人值守训练中，可能错过关键的能力退化信号。
