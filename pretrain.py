@@ -484,8 +484,8 @@ def main():
                 with open("outputs/system_telemetry.json", "w") as f:
                     json.dump(monitor.get_telemetry_report(), f, indent=2)
 
-                # Non-blocking asynchronous checkpoint and manifest update every 500 steps
-                if (step + 1) % 500 == 0:
+                # Non-blocking asynchronous checkpoint and manifest update every 50 steps
+                if (step + 1) % 50 == 0:
                     saver.save_checkpoint(
                         model=model,
                         optimizer=optimizer,
