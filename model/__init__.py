@@ -2,7 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Any
 
 from model.config import ModelConfig
 from model.mla import MultiHeadLatentAttention
