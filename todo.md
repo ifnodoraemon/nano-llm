@@ -1,6 +1,18 @@
 # nano-llm 项目全链路完整待办事项 (Comprehensive ToDo & Gaps Roadmap)
 
-目标：打通预训练、微调(SFT)、对齐(DPO)以及强化学习(GRPO)全链路，打造专属的顶级 2B (或1.5B) 稠密基座模型与前沿“指代识图”智能体。
+> **最新进展通知 (2026-06-03)**:
+> 所有的 **P0** 和 **P1** 级核心待办漏洞与技术 Bug 已经 **100% 全部闭环完成**，并同步推送合入主线仓库。
+> 主要修复与实现内容包括：
+> 1. **PagedAttention 彻底接入**：打通 vLLM 风格虚拟物理页表映射，将 PagedAttention 写入 forward 自注意力计算流中。
+> 2. **MCTS KV-cache 优化**：将 MCTS 推理由 $O(N^2)$ 自回归优化至 $O(N)$ 级别的 KV-cache 复用，彻底消除推理速度瓶颈。
+> 3. **DPO 验证集与 Tokenizer 适配**：引入 10% 的 Chosen-Rejected 验证对，每 50 步评估一次 Validation DPO Loss 与 Chosen vs Rejected Accuracy；Tokenizer 路径与 `--sft_checkpoint_path` 动态绑定。
+> 4. **数据污染自检器**：实现 `scripts/detect_contamination.py`，基于 3-gram 相似度对训练语料和评估 benchmarks 执行去污染清洗。
+> 5. **自动化阶段间评估触发器**：在 `pretrain.py`, `train.py`, `align.py`, `grpo.py` 的末尾嵌入 Benchmark 自动运行 Hook，实现全自动阶段间指标 diff。
+> 6. **注意力泄露与交叉污染消除**：在 `train.py` 中构造 Block-Diagonal Causal Attention Mask，防止 sequence packing 时独立样本的注意力泄露。
+> 7. **Evol-Instruct 变异 Tokenization 修复**：强制变异 prompt 文本重编码，消除 GRPO 优势计算的双重归一化冲突，结合奖励反作弊机制，保障 GRPO 强化学习顺利收敛。
+> 8. **预训练 MFU 集群计算修正**：将 pretrain.py 中的 MFU 分母修正为集群总算力，同时将预训练 checkpoint 频率提升为每 50 步，保障非阻塞异步保存与弹性热重启。
+> 
+> 目前基座 2B-dense 预训练已经重新启动，正在使用全新的优化框架进行安全运行。
 
 ---
 
