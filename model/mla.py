@@ -4,7 +4,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any
 
 from model.config import ModelConfig
 
@@ -46,6 +46,8 @@ class MultiHeadLatentAttention(nn.Module):
         mask: Optional[torch.Tensor] = None,
         start_pos: Optional[int] = None,
         kv_cache = None,  # Tensor for latent cache, Tuple for standard cache
+        seq_id: Optional[int] = None,
+        cache_manager: Optional[Any] = None
     ) -> torch.Tensor:
         from model import apply_rotary_emb  # lazy import to avoid circular dependency
 
