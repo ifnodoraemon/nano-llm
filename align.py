@@ -82,6 +82,60 @@ def compute_dpo_loss(
     
     return loss, chosen_rewards.mean(), rejected_rewards.mean(), accuracy
 
+@torch.no_grad()
+def evaluate_val_loss(policy_model, reference_model, val_dataloader, device, dtype, beta, ddp):
+    """
+    Evaluates policy vs reference model on validation dataset.
+    Returns (avg_val_loss, avg_val_accuracy).
+    """
+    policy_model.eval()
+    val_loss = 0.0
+    val_accuracy = 0.0
+    steps = 0
+    
+    for batch in val_dataloader:
+        c_input_ids = batch["chosen_input_ids"].to(device, non_blocking=True)
+        c_labels = batch["chosen_labels"].to(device, non_blocking=True)
+        r_input_ids = batch["rejected_input_ids"].to(device, non_blocking=True)
+        r_labels = batch["rejected_labels"].to(device, non_blocking=True)
+        
+        with torch.amp.autocast("cuda", dtype=dtype, enabled=torch.cuda.is_available()):
+            policy_chosen_logits, _, _ = policy_model(c_input_ids)
+            policy_chosen_logprobs = compute_logprobs(policy_chosen_logits, c_labels)
+            
+            policy_rejected_logits, _, _ = policy_model(r_input_ids)
+            policy_rejected_logprobs = compute_logprobs(policy_rejected_logits, r_labels)
+            
+            ref_chosen_logits, _, _ = reference_model(c_input_ids)
+            ref_chosen_logprobs = compute_logprobs(ref_chosen_logits, c_labels)
+            
+            ref_rejected_logits, _, _ = reference_model(r_input_ids)
+            ref_rejected_logprobs = compute_logprobs(ref_rejected_logits, r_labels)
+            
+        loss, _, _, accuracy = compute_dpo_loss(
+            policy_chosen_logprobs=policy_chosen_logprobs,
+            policy_rejected_logprobs=policy_rejected_logprobs,
+            reference_chosen_logprobs=ref_chosen_logprobs,
+            reference_rejected_logprobs=ref_rejected_logprobs,
+            beta=beta
+        )
+        
+        val_loss += loss.item()
+        val_accuracy += accuracy.item()
+        steps += 1
+        
+    avg_loss = val_loss / max(steps, 1)
+    avg_accuracy = val_accuracy / max(steps, 1)
+    
+    if ddp:
+        metrics = torch.tensor([avg_loss, avg_accuracy], device=device)
+        dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
+        avg_loss = (metrics[0] / dist.get_world_size()).item()
+        avg_accuracy = (metrics[1] / dist.get_world_size()).item()
+        
+    policy_model.train()
+    return avg_loss, avg_accuracy
+
 # ==============================================================================
 # Main Orchestrated DPO DDP Alignment Script
 # ==============================================================================
@@ -130,7 +184,9 @@ def train():
 
     # 2. Tokenizer & Dataset Loader
     logger.info("Initializing tokenizer...")
-    tokenizer = load_tokenizer(fallback_model_name="qwen/Qwen2.5-7B")
+    model_dir = os.path.dirname(args.sft_checkpoint_path)
+    tokenizer_path = model_dir if model_dir and os.path.exists(os.path.join(model_dir, "tokenizer_config.json")) else "qwen/Qwen2.5-7B"
+    tokenizer = load_tokenizer(fallback_model_name=tokenizer_path)
 
     dataset = DPODataset(
         data_path=args.data_path, 
@@ -140,7 +196,17 @@ def train():
     )
     validate_dataset(dataset, tokenizer=tokenizer, name="DPO training dataset")
     
-    sampler = DistributedSampler(dataset, num_replicas=ddp_world_size, rank=ddp_rank, shuffle=True) if ddp else None
+    # Split dataset into train and validation sets (90% train, 10% val)
+    val_size = int(0.1 * len(dataset))
+    if val_size == 0 and len(dataset) > 1:
+        val_size = 1
+    train_size = len(dataset) - val_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size], generator=torch.Generator().manual_seed(args.seed)
+    )
+    
+    train_sampler = DistributedSampler(train_dataset, num_replicas=ddp_world_size, rank=ddp_rank, shuffle=True) if ddp else None
+    val_sampler = DistributedSampler(val_dataset, num_replicas=ddp_world_size, rank=ddp_rank, shuffle=False) if ddp else None
     
     # Custom DPO collator (since chosen & rejected are padded separately in PyTorch loaders)
     def dpo_collator(samples):
@@ -158,10 +224,18 @@ def train():
         return batch
 
     dataloader = DataLoader(
-        dataset, 
+        train_dataset, 
         batch_size=args.batch_size, 
-        sampler=sampler, 
-        shuffle=(sampler is None),
+        sampler=train_sampler, 
+        shuffle=(train_sampler is None),
+        collate_fn=dpo_collator,
+        pin_memory=True
+    )
+    val_dataloader = DataLoader(
+        val_dataset, 
+        batch_size=args.batch_size, 
+        sampler=val_sampler, 
+        shuffle=False,
         collate_fn=dpo_collator,
         pin_memory=True
     )
@@ -279,6 +353,23 @@ def train():
                     optimizer.zero_grad(set_to_none=True)
                     step_counter += 1
 
+                    if step_counter % 50 == 0:
+                        val_loss, val_acc = evaluate_val_loss(
+                            policy_model=policy_model,
+                            reference_model=reference_model,
+                            val_dataloader=val_dataloader,
+                            device=device,
+                            dtype=dtype,
+                            beta=args.beta,
+                            ddp=ddp
+                        )
+                        if is_master:
+                            tracker.log({
+                                "val/dpo_loss": val_loss,
+                                "val/dpo_accuracy": val_acc * 100
+                            }, step=step_counter)
+                            logger.info(f"📊 Validation DPO Loss: {val_loss:.4f} | Accuracy: {val_acc*100:.1f}%")
+
                     if is_master and step_counter % 5 == 0:
                         elapsed = time.time() - start_time
                         tracker.log({
@@ -327,9 +418,20 @@ def train():
                 }, f, indent=4)
             logger.info(f"DPO training manifest saved to {manifest_path}")
 
+            # Automated stage evaluation benchmark hook
+            import subprocess
+            import sys
+            try:
+                logger.info("🔥 Starting automated evaluation benchmark hook...")
+                subprocess.run([sys.executable, "eval_benchmarks.py", "--checkpoint_path", final_path], check=True)
+                logger.info("✅ Automated evaluation benchmark hook finished.")
+            except Exception as e:
+                logger.error(f"Failed to run automated benchmark hook: {e}")
+
         if ddp:
             dist.destroy_process_group()
         logger.info("nano-llm: DPO alignment completed successfully!")
+
 
     finally:
         if is_master:

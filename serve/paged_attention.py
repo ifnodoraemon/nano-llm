@@ -62,7 +62,7 @@ def generate_with_paged_attention_continuous_batching(
                     cm.allocate_blocks(req["id"], num_blocks)
 
                 x = torch.tensor([req["tokens"]], dtype=torch.long, device=device)
-                logits, _, _ = model(x, start_pos=0)
+                logits, _, _ = model(x, start_pos=0, seq_id=req["id"], cache_managers=cache_managers)
                 last_logits = logits[:, -1, :]
                 next_token = torch.argmax(last_logits, dim=-1).item()
                 req["generated"].append(next_token)
@@ -76,7 +76,7 @@ def generate_with_paged_attention_continuous_batching(
             for req in active_decode_batch:
                 last_token = req["generated"][-1]
                 x_step = torch.tensor([[last_token]], dtype=torch.long, device=device)
-                logits, _, _ = model(x_step, start_pos=req["curr_pos"])
+                logits, _, _ = model(x_step, start_pos=req["curr_pos"], seq_id=req["id"], cache_managers=cache_managers)
                 next_tok = torch.argmax(logits[:, -1, :], dim=-1).item()
                 req["generated"].append(next_tok)
                 req["curr_pos"] += 1
@@ -87,6 +87,7 @@ def generate_with_paged_attention_continuous_batching(
                     for cm in cache_managers:
                         cm.free_sequence(req["id"])
                     logger.info(f"[Continuous Batching] Request {req['id']} completed.")
+
 
         step += 1
         if step > max_new_tokens * 2:

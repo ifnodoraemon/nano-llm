@@ -516,6 +516,17 @@ def main():
             torch.save(checkpoint_payload, timestamped_path)
             logger.info("✅ Pre-training stage successfully completed!")
 
+            # Automated stage evaluation benchmark hook
+            import subprocess
+            import sys
+            try:
+                logger.info("🔥 Starting automated evaluation benchmark hook...")
+                subprocess.run([sys.executable, "eval_benchmarks.py", "--checkpoint_path", checkpoint_path], check=True)
+                logger.info("✅ Automated evaluation benchmark hook finished.")
+            except Exception as e:
+                logger.error(f"Failed to run automated benchmark hook: {e}")
+
+
     finally:
         if master_process:
             tracker.finish()

@@ -389,9 +389,20 @@ def train():
             torch.save(checkpoint_payload, final_path)
             torch.save(checkpoint_payload, timestamped_path)
 
+            # Automated stage evaluation benchmark hook
+            import subprocess
+            import sys
+            try:
+                logger.info("🔥 Starting automated evaluation benchmark hook...")
+                subprocess.run([sys.executable, "eval_benchmarks.py", "--checkpoint_path", final_path], check=True)
+                logger.info("✅ Automated evaluation benchmark hook finished.")
+            except Exception as e:
+                logger.error(f"Failed to run automated benchmark hook: {e}")
+
         if ddp:
             dist.destroy_process_group()
         logger.info("nano-llm: SFT Succeeded!")
+
 
     finally:
         if is_master:

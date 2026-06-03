@@ -119,14 +119,14 @@ class PagedAttentionKernel(nn.Module):
         """
         num_heads = q.size(1)
         head_dim = q.size(2)
+        n_kv_heads = cache_manager.num_heads
+        n_rep = num_heads // n_kv_heads
         
         page_table = cache_manager.page_tables[seq_id]
         
         # Step 1. Gather scattered KV states from physical blocks to a temporary stack
-        # Temporarily rebuild continuous keys/values only for active query length seq_len
-        # In low-level vLLM, this is calculated directly in-place inside CUDA/Triton kernels!
-        gathered_k = torch.zeros(seq_len, num_heads, head_dim, dtype=torch.float16, device=q.device)
-        gathered_v = torch.zeros(seq_len, num_heads, head_dim, dtype=torch.float16, device=q.device)
+        gathered_k = torch.zeros(seq_len, n_kv_heads, head_dim, dtype=torch.float16, device=q.device)
+        gathered_v = torch.zeros(seq_len, n_kv_heads, head_dim, dtype=torch.float16, device=q.device)
         
         for i in range(seq_len):
             block_idx = i // cache_manager.block_size
@@ -137,6 +137,19 @@ class PagedAttentionKernel(nn.Module):
             
             gathered_k[i] = block.k_buffer[slot_idx]
             gathered_v[i] = block.v_buffer[slot_idx]
+            
+        # Repeat KV heads for Grouped-Query Attention (GQA)
+        if n_rep > 1:
+            gathered_k = (
+                gathered_k[:, :, None, :]
+                .expand(seq_len, n_kv_heads, n_rep, head_dim)
+                .reshape(seq_len, num_heads, head_dim)
+            )
+            gathered_v = (
+                gathered_v[:, :, None, :]
+                .expand(seq_len, n_kv_heads, n_rep, head_dim)
+                .reshape(seq_len, num_heads, head_dim)
+            )
             
         # Reshape gathered keys/values to calculate dot products
         # gathered_k: [SeqLen, Num_heads, Head_dim] -> [Num_heads, SeqLen, Head_dim]
@@ -157,3 +170,4 @@ class PagedAttentionKernel(nn.Module):
         
         # Return reshaped output: [1, Num_heads, Head_dim]
         return out.transpose(0, 1)
+

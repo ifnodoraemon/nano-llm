@@ -188,22 +188,54 @@ class MCTSEngine:
         return self.tokenizer.decode(full_tokens[0].tolist(), skip_special_tokens=True)
 
     def _generate_step_chunk(self, seq: torch.Tensor, max_tokens: int = 32) -> torch.Tensor:
-        """Generates a small reasoning chunk autoregressively."""
+        """Generates a small reasoning chunk autoregressively using KV-cache to avoid O(N^2) complexity."""
         generated = []
         device = next(self.model.parameters()).device
-        curr_seq = seq.clone().to(device)
+        dtype = next(self.model.parameters()).dtype
         
-        for _ in range(max_tokens):
-            logits, _, _ = self.model(curr_seq)
+        seq_len = seq.size(1)
+        max_block_size = seq_len + max_tokens + 8
+        
+        # Pre-allocate KV cache buffers
+        n_kv_heads = self.model.config.n_kv_head if self.model.config.n_kv_head is not None else self.model.config.n_head
+        head_dim = self.model.config.n_embd // self.model.config.n_head
+        use_mla = getattr(self.model.config, 'use_mla', False)
+        
+        kv_caches = []
+        for _ in range(self.model.config.n_layer):
+            if use_mla:
+                kv_comp_dim = getattr(self.model.config, 'kv_comp_dim', 128)
+                latent_cache = torch.zeros(1, max_block_size, kv_comp_dim, device=device, dtype=dtype)
+                kv_caches.append(latent_cache)
+            else:
+                k_cache = torch.zeros(1, max_block_size, n_kv_heads, head_dim, device=device, dtype=dtype)
+                v_cache = torch.zeros(1, max_block_size, n_kv_heads, head_dim, device=device, dtype=dtype)
+                kv_caches.append((k_cache, v_cache))
+                
+        # Prefill prompt sequence
+        curr_seq = seq.to(device)
+        logits, _, _ = self.model(curr_seq, start_pos=0, kv_caches=kv_caches)
+        
+        next_token_logits = logits[:, -1, :] / 0.8
+        probs = F.softmax(next_token_logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+        generated.append(next_token)
+        
+        eos_ids = [self.tokenizer.eos_token_id]
+        if hasattr(self.tokenizer, 'special_tokens') and "<|im_end|>" in self.tokenizer.special_tokens:
+            eos_ids.append(self.tokenizer.special_tokens["<|im_end|>"])
+            
+        curr_pos = seq_len
+        for _ in range(max_tokens - 1):
+            if next_token.item() in eos_ids or next_token.item() == 13: # 13 is often '\n'
+                break
+                
+            logits, _, _ = self.model(next_token, start_pos=curr_pos, kv_caches=kv_caches)
             next_token_logits = logits[:, -1, :] / 0.8
             probs = F.softmax(next_token_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
-            
             generated.append(next_token)
-            curr_seq = torch.cat([curr_seq, next_token], dim=-1)
+            curr_pos += 1
             
-            # Stop if we hit a newline (end of reasoning step) or terminal token
-            if next_token.item() == self.tokenizer.eos_token_id or next_token.item() == 13: # 13 is often '\n'
-                break
-                
         return torch.cat(generated, dim=-1).cpu()
+

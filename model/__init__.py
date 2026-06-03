@@ -202,7 +202,9 @@ class CausalSelfAttention(nn.Module):
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         start_pos: Optional[int] = None,
-        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        seq_id: Optional[int] = None,
+        cache_manager: Optional[Any] = None
     ) -> torch.Tensor:
         bsz, seqlen, _ = x.shape
 
@@ -214,36 +216,68 @@ class CausalSelfAttention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        if kv_cache is not None and start_pos is not None:
-            cache_k, cache_v = kv_cache
-            cache_k[:, start_pos : start_pos + seqlen] = xk
-            cache_v[:, start_pos : start_pos + seqlen] = xv
+        if cache_manager is not None and seq_id is not None:
+            # Write to virtual block cache map (vLLM style PagedAttention cache)
+            for i in range(seqlen):
+                cache_manager.write_to_cache(
+                    seq_id=seq_id,
+                    logical_pos=start_pos + i,
+                    k_token=xk[0, i],
+                    v_token=xv[0, i]
+                )
+            if seqlen == 1:
+                from utils.paged_attention import PagedAttentionKernel
+                kernel = PagedAttentionKernel(self.head_dim).to(x.device)
+                q = xq.transpose(1, 2).squeeze(2)  # Shape [1, n_heads, head_dim]
+                attn_out = kernel(q, seq_id, cache_manager, seq_len=start_pos + seqlen)  # Shape [1, n_heads, head_dim]
+                output = attn_out.unsqueeze(2)  # Shape [1, n_heads, 1, head_dim]
+            else:
+                xk_rep = self.repeat_kv(xk, self.n_rep)
+                xv_rep = self.repeat_kv(xv, self.n_rep)
+                xq_t = xq.transpose(1, 2)
+                xk_t = xk_rep.transpose(1, 2)
+                xv_t = xv_rep.transpose(1, 2)
+                custom_scale = (1.0 / math.sqrt(self.head_dim)) * self.attn_scale_multiplier
+                with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
+                    output = F.scaled_dot_product_attention(
+                        xq_t, xk_t, xv_t,
+                        attn_mask=mask,
+                        dropout_p=0.0,
+                        is_causal=True if mask is None and start_pos is None else False,
+                        scale=custom_scale
+                    )
+        else:
+            if kv_cache is not None and start_pos is not None:
+                cache_k, cache_v = kv_cache
+                cache_k[:, start_pos : start_pos + seqlen] = xk
+                cache_v[:, start_pos : start_pos + seqlen] = xv
 
-            xk = cache_k[:, : start_pos + seqlen]
-            xv = cache_v[:, : start_pos + seqlen]
+                xk = cache_k[:, : start_pos + seqlen]
+                xv = cache_v[:, : start_pos + seqlen]
 
-        xk = self.repeat_kv(xk, self.n_rep)
-        xv = self.repeat_kv(xv, self.n_rep)
+            xk = self.repeat_kv(xk, self.n_rep)
+            xv = self.repeat_kv(xv, self.n_rep)
 
-        xq = xq.transpose(1, 2)
-        xk = xk.transpose(1, 2)
-        xv = xv.transpose(1, 2)
+            xq = xq.transpose(1, 2)
+            xk = xk.transpose(1, 2)
+            xv = xv.transpose(1, 2)
 
-        # Multiply standard scaling by attn_scale_multiplier to sharpen/soften attention maps
-        custom_scale = (1.0 / math.sqrt(self.head_dim)) * self.attn_scale_multiplier
+            # Multiply standard scaling by attn_scale_multiplier to sharpen/soften attention maps
+            custom_scale = (1.0 / math.sqrt(self.head_dim)) * self.attn_scale_multiplier
 
-        # Force high-efficiency SDPA backends (FlashAttention/Mem-Efficient) and disable Math fallback
-        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
-            output = F.scaled_dot_product_attention(
-                xq, xk, xv,
-                attn_mask=mask,
-                dropout_p=0.0,
-                is_causal=True if mask is None and start_pos is None else False,
-                scale=custom_scale
-            )
+            # Force high-efficiency SDPA backends (FlashAttention/Mem-Efficient) and disable Math fallback
+            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable_mem_efficient=True):
+                output = F.scaled_dot_product_attention(
+                    xq, xk, xv,
+                    attn_mask=mask,
+                    dropout_p=0.0,
+                    is_causal=True if mask is None and start_pos is None else False,
+                    scale=custom_scale
+                )
 
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
+
 
 
 class TransformerBlock(nn.Module):
@@ -269,12 +303,23 @@ class TransformerBlock(nn.Module):
         mask: Optional[torch.Tensor] = None,
         start_pos: Optional[int] = None,
         kv_cache = None,  # Tensor (MLA latent) or Tuple[Tensor, Tensor] (standard KV cache)
+        seq_id: Optional[int] = None,
+        cache_manager: Optional[Any] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         use_triton = getattr(self.feed_forward.config if hasattr(self.feed_forward, 'config') else self.attention.config, 'use_triton', False)
-        h = x + self.attention(self.attention_norm(x, use_triton=use_triton), freqs_cis, mask, start_pos, kv_cache)
+        h = x + self.attention(
+            self.attention_norm(x, use_triton=use_triton), 
+            freqs_cis, 
+            mask, 
+            start_pos, 
+            kv_cache, 
+            seq_id=seq_id, 
+            cache_manager=cache_manager
+        )
         out = h + self.feed_forward(self.ffn_norm(h, use_triton=use_triton))
         aux_loss = getattr(self.feed_forward, 'aux_loss', None) if hasattr(self.feed_forward, 'aux_loss') else None
         return out, aux_loss
+
 
 
 # ==============================================================================
@@ -357,6 +402,8 @@ class Transformer(nn.Module):
         kv_caches: Optional[List] = None,  # List of Tensor (MLA) or Tuple[Tensor, Tensor] (standard)
         return_all_logits: bool = False,
         mask: Optional[torch.Tensor] = None,
+        seq_id: Optional[int] = None,
+        cache_managers: Optional[List] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         _bsz, seqlen = tokens.shape
 
@@ -389,15 +436,32 @@ class Transformer(nn.Module):
         total_aux_loss = torch.tensor(0.0, device=h.device)
         for idx, layer in enumerate(self.layers):
             layer_cache = kv_caches[idx] if kv_caches is not None else None
+            layer_cm = cache_managers[idx] if cache_managers is not None else None
 
             if self.training and self.config.use_checkpoint:
                 from torch.utils.checkpoint import checkpoint
                 def custom_layer_forward(hidden_states, rope_freqs):
-                    out, _ = layer(hidden_states, rope_freqs, mask=mask, start_pos=start_pos, kv_cache=layer_cache)
+                    out, _ = layer(
+                        hidden_states, 
+                        rope_freqs, 
+                        mask=mask, 
+                        start_pos=start_pos, 
+                        kv_cache=layer_cache,
+                        seq_id=seq_id,
+                        cache_manager=layer_cm
+                    )
                     return out
                 h = checkpoint(custom_layer_forward, h, freqs_cis, use_reentrant=False)
             else:
-                h, aux_loss = layer(h, freqs_cis, mask=mask, start_pos=start_pos, kv_cache=layer_cache)
+                h, aux_loss = layer(
+                    h, 
+                    freqs_cis, 
+                    mask=mask, 
+                    start_pos=start_pos, 
+                    kv_cache=layer_cache,
+                    seq_id=seq_id,
+                    cache_manager=layer_cm
+                )
                 if aux_loss is not None:
                     total_aux_loss = total_aux_loss + aux_loss
 
