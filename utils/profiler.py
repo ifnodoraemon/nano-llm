@@ -2,12 +2,20 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Theoretical Peak BF16/FP16 performance for common GPUs (in FLOPS):
-# - H800/H100 SXM5: approx 2000e12 (with Tensor Cores). 
-# - H800/H100 PCIe: approx 700e12.
-# - Without sparsity optimizations, dense peak is approx 200 TFLOPS (200e12) or higher depending on SXM configuration.
-# We default to 200 TFLOPS (200e12) as a highly reliable baseline for dense BF16 training on H800.
-PEAK_H800_FLOPS = 200e12 
+# Theoretical Peak BF16 Tensor Core performance for NVIDIA H800 SXM5:
+#   - With Sparsity:  ~989 TFLOPS
+#   - Dense (no sparsity): ~495 TFLOPS
+#
+# Industry standard MFU (Model FLOPs Utilization) uses the DENSE Tensor Core peak
+# as the denominator, consistent with PaLM, Chinchilla, and LLaMA papers.
+#
+# H800 SXM5 Dense BF16 peak = 495 TFLOPS = 495e12 FLOPS
+# Ref: https://www.nvidia.com/en-us/data-center/h100/
+#
+# NOTE: Previous values were inconsistent:
+#   - profiler.py used 200e12 (too low → MFU inflated to ~100%)
+#   - pretrain.py hardcoded 312e12 (A100 value → MFU deflated to ~47%)
+PEAK_H800_FLOPS = 495e12 
 
 def estimate_step_flops(
     n_parameters: int, 

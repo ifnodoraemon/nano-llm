@@ -537,13 +537,13 @@ def main():
             dt = t1 - t0
             t0 = t1
 
-            # Convert DT step time to MFU using H800 peak theoretical FLOPs (312 TFLOPS bfloat16)
+            # Convert DT step time to MFU using H800 peak theoretical FLOPs
             mfu_percentage = calculate_mfu(
                 step_flops=step_flops,
                 elapsed_time=dt,
                 grad_accum_steps=current_grad_accum_steps,
                 world_size=ddp_world_size,
-                peak_flops=312e12
+                # Uses PEAK_H800_FLOPS default from profiler.py (495 TFLOPS dense BF16)
             )
             mfu_percentage = min(100.0, max(0.0, mfu_percentage))
 
