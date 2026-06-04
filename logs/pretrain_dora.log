@@ -1,0 +1,161 @@
+W0526 14:28:52.559000 1767270 torch/distributed/run.py:852] 
+W0526 14:28:52.559000 1767270 torch/distributed/run.py:852] *****************************************
+W0526 14:28:52.559000 1767270 torch/distributed/run.py:852] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0526 14:28:52.559000 1767270 torch/distributed/run.py:852] *****************************************
+usage: pretrain.py [-h] [--batch_size BATCH_SIZE] [--block_size BLOCK_SIZE]
+                   [--max_steps MAX_STEPS] [--warmup_steps WARMUP_STEPS]
+                   [--lr LR] [--min_lr MIN_LR] [--weight_decay WEIGHT_DECAY]
+                   [--grad_clip GRAD_CLIP]
+                   [--grad_accum_steps GRAD_ACCUM_STEPS] [--use_fp8 USE_FP8]
+                   [--data_dir DATA_DIR] [--out_dir OUT_DIR]
+                   [--tp_size TP_SIZE] [--pp_size PP_SIZE] [--ep_size EP_SIZE]
+                   [--use_triton_mla USE_TRITON_MLA] [--use_triton USE_TRITON]
+pretrain.py: error: unrecognized arguments: --learning_rate 3e-4
+usage: pretrain.py [-h] [--batch_size BATCH_SIZE] [--block_size BLOCK_SIZE]
+                   [--max_steps MAX_STEPS] [--warmup_steps WARMUP_STEPS]
+                   [--lr LR] [--min_lr MIN_LR] [--weight_decay WEIGHT_DECAY]
+                   [--grad_clip GRAD_CLIP]
+                   [--grad_accum_steps GRAD_ACCUM_STEPS] [--use_fp8 USE_FP8]
+                   [--data_dir DATA_DIR] [--out_dir OUT_DIR]
+                   [--tp_size TP_SIZE] [--pp_size PP_SIZE] [--ep_size EP_SIZE]
+                   [--use_triton_mla USE_TRITON_MLA] [--use_triton USE_TRITON]
+pretrain.py: error: unrecognized arguments: --learning_rate 3e-4
+usage: pretrain.py [-h] [--batch_size BATCH_SIZE] [--block_size BLOCK_SIZE]
+                   [--max_steps MAX_STEPS] [--warmup_steps WARMUP_STEPS]
+                   [--lr LR] [--min_lr MIN_LR] [--weight_decay WEIGHT_DECAY]
+                   [--grad_clip GRAD_CLIP]
+                   [--grad_accum_steps GRAD_ACCUM_STEPS] [--use_fp8 USE_FP8]
+                   [--data_dir DATA_DIR] [--out_dir OUT_DIR]
+                   [--tp_size TP_SIZE] [--pp_size PP_SIZE] [--ep_size EP_SIZE]
+                   [--use_triton_mla USE_TRITON_MLA] [--use_triton USE_TRITON]
+pretrain.py: error: unrecognized arguments: --learning_rate 3e-4
+usage: pretrain.py [-h] [--batch_size BATCH_SIZE] [--block_size BLOCK_SIZE]
+                   [--max_steps MAX_STEPS] [--warmup_steps WARMUP_STEPS]
+                   [--lr LR] [--min_lr MIN_LR] [--weight_decay WEIGHT_DECAY]
+                   [--grad_clip GRAD_CLIP]
+                   [--grad_accum_steps GRAD_ACCUM_STEPS] [--use_fp8 USE_FP8]
+                   [--data_dir DATA_DIR] [--out_dir OUT_DIR]
+                   [--tp_size TP_SIZE] [--pp_size PP_SIZE] [--ep_size EP_SIZE]
+                   [--use_triton_mla USE_TRITON_MLA] [--use_triton USE_TRITON]
+pretrain.py: error: unrecognized arguments: --learning_rate 3e-4
+usage: pretrain.py [-h] [--batch_size BATCH_SIZE] [--block_size BLOCK_SIZE]
+                   [--max_steps MAX_STEPS] [--warmup_steps WARMUP_STEPS]
+                   [--lr LR] [--min_lr MIN_LR] [--weight_decay WEIGHT_DECAY]
+                   [--grad_clip GRAD_CLIP]
+                   [--grad_accum_steps GRAD_ACCUM_STEPS] [--use_fp8 USE_FP8]
+                   [--data_dir DATA_DIR] [--out_dir OUT_DIR]
+                   [--tp_size TP_SIZE] [--pp_size PP_SIZE] [--ep_size EP_SIZE]
+                   [--use_triton_mla USE_TRITON_MLA] [--use_triton USE_TRITON]
+pretrain.py: error: unrecognized arguments: --learning_rate 3e-4
+usage: pretrain.py [-h] [--batch_size BATCH_SIZE] [--block_size BLOCK_SIZE]
+                   [--max_steps MAX_STEPS] [--warmup_steps WARMUP_STEPS]
+                   [--lr LR] [--min_lr MIN_LR] [--weight_decay WEIGHT_DECAY]
+                   [--grad_clip GRAD_CLIP]
+                   [--grad_accum_steps GRAD_ACCUM_STEPS] [--use_fp8 USE_FP8]
+                   [--data_dir DATA_DIR] [--out_dir OUT_DIR]
+                   [--tp_size TP_SIZE] [--pp_size PP_SIZE] [--ep_size EP_SIZE]
+                   [--use_triton_mla USE_TRITON_MLA] [--use_triton USE_TRITON]
+pretrain.py: error: unrecognized arguments: --learning_rate 3e-4
+usage: pretrain.py [-h] [--batch_size BATCH_SIZE] [--block_size BLOCK_SIZE]
+                   [--max_steps MAX_STEPS] [--warmup_steps WARMUP_STEPS]
+                   [--lr LR] [--min_lr MIN_LR] [--weight_decay WEIGHT_DECAY]
+                   [--grad_clip GRAD_CLIP]
+                   [--grad_accum_steps GRAD_ACCUM_STEPS] [--use_fp8 USE_FP8]
+                   [--data_dir DATA_DIR] [--out_dir OUT_DIR]
+                   [--tp_size TP_SIZE] [--pp_size PP_SIZE] [--ep_size EP_SIZE]
+                   [--use_triton_mla USE_TRITON_MLA] [--use_triton USE_TRITON]
+pretrain.py: error: unrecognized arguments: --learning_rate 3e-4
+usage: pretrain.py [-h] [--batch_size BATCH_SIZE] [--block_size BLOCK_SIZE]
+                   [--max_steps MAX_STEPS] [--warmup_steps WARMUP_STEPS]
+                   [--lr LR] [--min_lr MIN_LR] [--weight_decay WEIGHT_DECAY]
+                   [--grad_clip GRAD_CLIP]
+                   [--grad_accum_steps GRAD_ACCUM_STEPS] [--use_fp8 USE_FP8]
+                   [--data_dir DATA_DIR] [--out_dir OUT_DIR]
+                   [--tp_size TP_SIZE] [--pp_size PP_SIZE] [--ep_size EP_SIZE]
+                   [--use_triton_mla USE_TRITON_MLA] [--use_triton USE_TRITON]
+pretrain.py: error: unrecognized arguments: --learning_rate 3e-4
+W0526 14:28:54.548000 1767270 torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 1767337 closing signal SIGTERM
+W0526 14:28:54.549000 1767270 torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 1767338 closing signal SIGTERM
+W0526 14:28:54.550000 1767270 torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 1767339 closing signal SIGTERM
+W0526 14:28:54.550000 1767270 torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 1767340 closing signal SIGTERM
+W0526 14:28:54.550000 1767270 torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 1767342 closing signal SIGTERM
+W0526 14:28:54.551000 1767270 torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 1767343 closing signal SIGTERM
+W0526 14:28:54.551000 1767270 torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 1767344 closing signal SIGTERM
+E0526 14:28:54.584000 1767270 torch/distributed/elastic/multiprocessing/api.py:984] failed (exitcode: 2) local_rank: 4 (pid: 1767341) of binary: /usr/bin/python3
+Traceback (most recent call last):
+  File "/usr/local/bin/torchrun", line 8, in <module>
+    sys.exit(main())
+  File "/usr/local/lib/python3.10/dist-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 362, in wrapper
+    return f(*args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/torch/distributed/run.py", line 991, in main
+    run(args)
+  File "/usr/local/lib/python3.10/dist-packages/torch/distributed/run.py", line 982, in run
+    elastic_launch(
+  File "/usr/local/lib/python3.10/dist-packages/torch/distributed/launcher/api.py", line 170, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+  File "/usr/local/lib/python3.10/dist-packages/torch/distributed/launcher/api.py", line 317, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+pretrain.py FAILED
+------------------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-05-26_14:28:54
+  host      : h800-214
+  rank      : 0 (local_rank: 0)
+  exitcode  : -15 (pid: 1767337)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 1767337
+[2]:
+  time      : 2026-05-26_14:28:54
+  host      : h800-214
+  rank      : 1 (local_rank: 1)
+  exitcode  : 2 (pid: 1767338)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[3]:
+  time      : 2026-05-26_14:28:54
+  host      : h800-214
+  rank      : 2 (local_rank: 2)
+  exitcode  : 2 (pid: 1767339)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[4]:
+  time      : 2026-05-26_14:28:54
+  host      : h800-214
+  rank      : 3 (local_rank: 3)
+  exitcode  : 2 (pid: 1767340)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[5]:
+  time      : 2026-05-26_14:28:54
+  host      : h800-214
+  rank      : 5 (local_rank: 5)
+  exitcode  : 2 (pid: 1767342)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[6]:
+  time      : 2026-05-26_14:28:54
+  host      : h800-214
+  rank      : 6 (local_rank: 6)
+  exitcode  : 2 (pid: 1767343)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[7]:
+  time      : 2026-05-26_14:28:54
+  host      : h800-214
+  rank      : 7 (local_rank: 7)
+  exitcode  : -15 (pid: 1767344)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 1767344
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-05-26_14:28:54
+  host      : h800-214
+  rank      : 4 (local_rank: 4)
+  exitcode  : 2 (pid: 1767341)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================

@@ -632,6 +632,444 @@ def evaluate_safety(model: Transformer, tokenizer, device: str = "cuda") -> dict
 
 
 # ==============================================================================
+# 7. Trace-Level Tool Use Action Matching Evaluator (§2.3)
+# ==============================================================================
+
+# Inline test scenarios: each has a prompt, and a list of expected tool calls
+# with tool_name and a dict of expected parameter keys.
+TOOL_USE_SCENARIOS = [
+    {
+        "id": "weather_lookup",
+        "prompt": "What is the weather in San Francisco today?",
+        "expected_calls": [
+            {"tool_name": "get_weather", "params": {"city": "San Francisco", "unit": "celsius"}}
+        ]
+    },
+    {
+        "id": "calendar_create",
+        "prompt": "Schedule a meeting with Bob tomorrow at 3pm for 1 hour.",
+        "expected_calls": [
+            {"tool_name": "create_event", "params": {"title": "Meeting with Bob", "start_time": "3pm", "duration": "1h"}}
+        ]
+    },
+    {
+        "id": "search_and_summarize",
+        "prompt": "Search for the latest news about quantum computing and summarize the top result.",
+        "expected_calls": [
+            {"tool_name": "web_search", "params": {"query": "quantum computing"}},
+            {"tool_name": "summarize", "params": {"text": "<search_result>"}}
+        ]
+    },
+    {
+        "id": "file_read_write",
+        "prompt": "Read the file /data/report.csv and write a summary to /data/summary.txt.",
+        "expected_calls": [
+            {"tool_name": "read_file", "params": {"path": "/data/report.csv"}},
+            {"tool_name": "write_file", "params": {"path": "/data/summary.txt", "content": "<summary>"}}
+        ]
+    },
+    {
+        "id": "calculator",
+        "prompt": "What is 15% tip on a $85.50 dinner bill?",
+        "expected_calls": [
+            {"tool_name": "calculator", "params": {"expression": "85.50 * 0.15"}}
+        ]
+    },
+    {
+        "id": "translation",
+        "prompt": "Translate 'Hello, how are you?' to Japanese and French.",
+        "expected_calls": [
+            {"tool_name": "translate", "params": {"text": "Hello, how are you?", "target_language": "Japanese"}},
+            {"tool_name": "translate", "params": {"text": "Hello, how are you?", "target_language": "French"}}
+        ]
+    },
+    {
+        "id": "database_query",
+        "prompt": "Find all users who signed up in the last 7 days from the users database.",
+        "expected_calls": [
+            {"tool_name": "database_query", "params": {"table": "users", "filter": "signup_date"}}
+        ]
+    },
+    {
+        "id": "email_send",
+        "prompt": "Send an email to alice@example.com with subject 'Project Update' and body 'The project is on track.'",
+        "expected_calls": [
+            {"tool_name": "send_email", "params": {"to": "alice@example.com", "subject": "Project Update", "body": "The project is on track."}}
+        ]
+    },
+    {
+        "id": "image_generation",
+        "prompt": "Generate an image of a sunset over the ocean in watercolor style.",
+        "expected_calls": [
+            {"tool_name": "generate_image", "params": {"prompt": "sunset over the ocean", "style": "watercolor"}}
+        ]
+    },
+    {
+        "id": "multi_step_booking",
+        "prompt": "Find flights from NYC to London on Dec 20, then book the cheapest one.",
+        "expected_calls": [
+            {"tool_name": "search_flights", "params": {"origin": "NYC", "destination": "London", "date": "Dec 20"}},
+            {"tool_name": "book_flight", "params": {"flight_id": "<cheapest>"}}
+        ]
+    },
+    {
+        "id": "code_execution",
+        "prompt": "Run the Python code `print(2**10)` and tell me the result.",
+        "expected_calls": [
+            {"tool_name": "execute_code", "params": {"language": "python", "code": "print(2**10)"}}
+        ]
+    },
+    {
+        "id": "stock_analysis",
+        "prompt": "Get the current stock price of AAPL and calculate the 50-day moving average.",
+        "expected_calls": [
+            {"tool_name": "get_stock_price", "params": {"symbol": "AAPL"}},
+            {"tool_name": "calculator", "params": {"expression": "moving_average"}}
+        ]
+    },
+]
+
+
+def _parse_tool_calls_from_text(text: str) -> list[dict]:
+    """
+    Parses tool_call blocks from model-generated text.
+    Expected format:  ```tool_call\n{"name": ..., "arguments": {...}}\n```
+    Also handles <tool_call>...</tool_call> XML-style tags.
+    Returns a list of dicts with 'tool_name' and 'params' keys.
+    """
+    parsed_calls = []
+
+    # Pattern 1: fenced code blocks with tool_call label
+    fenced_pattern = r'```tool_call\s*\n(.*?)```'
+    # Pattern 2: XML-style <tool_call>...</tool_call> tags
+    xml_pattern = r'<tool_call>\s*(.*?)\s*</tool_call>'
+
+    blocks = re.findall(fenced_pattern, text, re.DOTALL)
+    blocks += re.findall(xml_pattern, text, re.DOTALL)
+
+    for block in blocks:
+        block = block.strip()
+        try:
+            data = json.loads(block)
+            tool_name = data.get("name", data.get("tool_name", ""))
+            params = data.get("arguments", data.get("params", data.get("parameters", {})))
+            if isinstance(params, str):
+                params = json.loads(params)
+            parsed_calls.append({"tool_name": tool_name, "params": params})
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    return parsed_calls
+
+
+def _compute_tool_f1(predicted_calls: list[dict], expected_calls: list[dict]) -> dict:
+    """
+    Computes precision, recall, and F1-score by comparing predicted tool calls
+    against expected ground-truth calls.
+
+    Matching criteria:
+      - Tool name exact match (case-insensitive)
+      - Parameter key overlap (keys present in both predicted and expected)
+    """
+    if not expected_calls:
+        # No expected calls: if prediction is also empty, perfect score
+        if not predicted_calls:
+            return {"precision": 1.0, "recall": 1.0, "f1": 1.0}
+        return {"precision": 0.0, "recall": 1.0, "f1": 0.0}
+
+    # Build flat sets of (tool_name, param_key) tuples for set-based F1
+    def _flatten(calls: list[dict]) -> set:
+        items = set()
+        for call in calls:
+            name = call.get("tool_name", "").lower().strip()
+            items.add(("__tool__", name))  # tool name as a matchable element
+            for key in call.get("params", {}).keys():
+                items.add((name, key.lower().strip()))
+        return items
+
+    pred_set = _flatten(predicted_calls)
+    gold_set = _flatten(expected_calls)
+
+    if not gold_set:
+        return {"precision": 1.0, "recall": 1.0, "f1": 1.0}
+
+    true_positives = len(pred_set & gold_set)
+    precision = true_positives / len(pred_set) if pred_set else 0.0
+    recall = true_positives / len(gold_set) if gold_set else 0.0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+
+    return {"precision": precision, "recall": recall, "f1": f1}
+
+
+@torch.no_grad()
+def evaluate_tool_use_traces(
+    model: Transformer,
+    tokenizer,
+    device: str = "cuda",
+    scenarios: list[dict] = None,
+) -> dict:
+    """
+    Trace-level agentic tool-use evaluation.
+
+    For each scenario, feeds the prompt to the model with a system message
+    instructing it to respond with tool_call blocks. Parses the generated
+    output, compares predicted tool names and parameter keys against ground
+    truth, and computes F1-score.
+
+    Returns:
+        dict with per-scenario metrics and aggregate F1.
+    """
+    if scenarios is None:
+        scenarios = TOOL_USE_SCENARIOS
+
+    logger.info(f"--- Running Trace-Level Tool Use Evaluation ({len(scenarios)} scenarios) ---")
+
+    system_instruction = (
+        "You are a helpful assistant with access to external tools. "
+        "When the user asks you to perform an action, respond with one or more "
+        "tool_call blocks in this format:\n"
+        "```tool_call\n"
+        '{"name": "<tool_name>", "arguments": {<json_params>}}\n'
+        "```\n"
+        "Only use tool_call blocks for actions. Provide no other text."
+    )
+
+    per_scenario = {}
+    total_f1 = 0.0
+
+    for scenario in scenarios:
+        sid = scenario["id"]
+        prompt = scenario["prompt"]
+        expected = scenario["expected_calls"]
+
+        formatted = (
+            f"<|im_start|>system\n{system_instruction}<|im_end|>\n"
+            f"<|im_start|>user\n{prompt}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
+
+        input_ids = tokenizer.encode(formatted, add_special_tokens=False)
+        generated_ids = list(input_ids)
+
+        eos_tokens = {tokenizer.eos_token_id}
+        try:
+            eos_tokens.add(tokenizer.encode("<|im_end|>", add_special_tokens=False)[0])
+        except Exception:
+            pass
+
+        for _ in range(512):
+            active_x = torch.tensor(
+                [generated_ids[-model.config.block_size:]],
+                dtype=torch.long, device=device,
+            )
+            logits, _, _ = model(active_x)
+            next_tok = torch.argmax(logits[0, -1, :]).item()
+            generated_ids.append(next_tok)
+            if next_tok in eos_tokens:
+                break
+
+        completion = tokenizer.decode(
+            generated_ids[len(input_ids):], skip_special_tokens=True
+        )
+
+        predicted = _parse_tool_calls_from_text(completion)
+        metrics = _compute_tool_f1(predicted, expected)
+        per_scenario[sid] = metrics
+        total_f1 += metrics["f1"]
+
+        logger.info(
+            f"  Scenario '{sid}': F1={metrics['f1']:.3f} "
+            f"(P={metrics['precision']:.3f}, R={metrics['recall']:.3f}) "
+            f"| predicted {len(predicted)} calls, expected {len(expected)}"
+        )
+
+    aggregate_f1 = total_f1 / len(scenarios) if scenarios else 0.0
+    logger.info(f"🏆 Tool-Use Trace Aggregate F1: {aggregate_f1:.4f}")
+
+    return {
+        "per_scenario": per_scenario,
+        "aggregate_f1": aggregate_f1,
+        "num_scenarios": len(scenarios),
+    }
+
+
+# ==============================================================================
+# 8. Interactive Sandbox Error-Injection Recovery Evaluator (§2.3)
+# ==============================================================================
+
+# Multi-step task scenarios with injected error responses.
+# Each scenario has an id, a multi-turn conversation, and the step index
+# at which an error is injected. The evaluator checks whether the model
+# produces self-correcting output after receiving the error.
+ERROR_INJECTION_SCENARIOS = [
+    {
+        "id": "rate_limit_retry",
+        "description": "Booking a hotel room; API returns rate-limit at step 2",
+        "steps": [
+            {"role": "user", "content": "Book me a hotel room in Paris for Dec 25-27."},
+            {"role": "assistant", "content": "```tool_call\n{\"name\": \"search_hotels\", \"arguments\": {\"city\": \"Paris\", \"checkin\": \"Dec 25\", \"checkout\": \"Dec 27\"}}\n```"},
+            {"role": "tool", "content": '{"error": "429 Rate Limit Exceeded. Please retry after 30 seconds."}'},
+        ],
+        "inject_step": 2,
+        "recovery_keywords": ["retry", "wait", "again", "try again", "moment", "rate limit", "apologize", "sorry"],
+    },
+    {
+        "id": "invalid_date_correction",
+        "description": "Scheduling a meeting; API returns invalid date error at step 2",
+        "steps": [
+            {"role": "user", "content": "Schedule a team sync for February 30th at 10am."},
+            {"role": "assistant", "content": "```tool_call\n{\"name\": \"create_event\", \"arguments\": {\"date\": \"Feb 30\", \"time\": \"10am\"}}\n```"},
+            {"role": "tool", "content": '{"error": "400 Bad Request: Invalid date. February 30 does not exist."}'},
+        ],
+        "inject_step": 2,
+        "recovery_keywords": ["invalid", "does not exist", "february 28", "february 29", "correct", "adjust", "valid date", "sorry"],
+    },
+    {
+        "id": "not_found_alternative",
+        "description": "Looking up a product; API returns 404 Not Found at step 2",
+        "steps": [
+            {"role": "user", "content": "Find the price of 'UltraWidget Pro X99' on our store."},
+            {"role": "assistant", "content": "```tool_call\n{\"name\": \"product_search\", \"arguments\": {\"query\": \"UltraWidget Pro X99\"}}\n```"},
+            {"role": "tool", "content": '{"error": "404 Not Found: No product matching UltraWidget Pro X99."}'},
+        ],
+        "inject_step": 2,
+        "recovery_keywords": ["not found", "couldn't find", "alternative", "similar", "did you mean", "no results", "sorry", "unable"],
+    },
+    {
+        "id": "auth_expired_reauth",
+        "description": "Fetching emails; API returns authentication error at step 3",
+        "steps": [
+            {"role": "user", "content": "Show me my latest emails."},
+            {"role": "assistant", "content": "Sure, let me fetch your recent emails."},
+            {"role": "assistant", "content": "```tool_call\n{\"name\": \"fetch_emails\", \"arguments\": {\"folder\": \"inbox\", \"limit\": 10}}\n```"},
+            {"role": "tool", "content": '{"error": "401 Unauthorized: Authentication token expired. Please re-authenticate."}'},
+        ],
+        "inject_step": 3,
+        "recovery_keywords": ["expired", "re-authenticate", "log in", "token", "authorize", "sign in", "session", "sorry"],
+    },
+    {
+        "id": "timeout_fallback",
+        "description": "Running a data analysis; API returns timeout at step 2",
+        "steps": [
+            {"role": "user", "content": "Analyze the sales data for Q4 2025 and generate a chart."},
+            {"role": "assistant", "content": "```tool_call\n{\"name\": \"run_analysis\", \"arguments\": {\"dataset\": \"sales_q4_2025\", \"chart\": true}}\n```"},
+            {"role": "tool", "content": '{"error": "504 Gateway Timeout: Analysis service did not respond within 60 seconds."}'},
+        ],
+        "inject_step": 2,
+        "recovery_keywords": ["timeout", "timed out", "retry", "try again", "smaller", "reduce", "sorry", "taking longer"],
+    },
+    {
+        "id": "quota_exceeded_downgrade",
+        "description": "Generating a high-res image; API returns quota exceeded at step 2",
+        "steps": [
+            {"role": "user", "content": "Generate a 4K wallpaper of a mountain landscape at sunrise."},
+            {"role": "assistant", "content": "```tool_call\n{\"name\": \"generate_image\", \"arguments\": {\"prompt\": \"mountain landscape sunrise\", \"resolution\": \"4K\"}}\n```"},
+            {"role": "tool", "content": '{"error": "402 Quota Exceeded: Your daily image generation quota has been reached."}'},
+        ],
+        "inject_step": 2,
+        "recovery_keywords": ["quota", "limit", "exceeded", "tomorrow", "lower resolution", "alternative", "sorry", "upgrade"],
+    },
+]
+
+
+@torch.no_grad()
+def evaluate_error_recovery(
+    model: Transformer,
+    tokenizer,
+    device: str = "cuda",
+    scenarios: list[dict] = None,
+) -> dict:
+    """
+    Interactive sandbox error-injection evaluator.
+
+    For each scenario, feeds the model a multi-turn conversation that ends
+    with an injected API error response. Checks whether the model's next
+    output contains self-correction behavior (retry, alternative approach,
+    error acknowledgment, etc.).
+
+    Returns:
+        dict with per-scenario results and aggregate recovery_rate.
+    """
+    if scenarios is None:
+        scenarios = ERROR_INJECTION_SCENARIOS
+
+    logger.info(f"--- Running Error-Injection Recovery Evaluation ({len(scenarios)} scenarios) ---")
+
+    recovery_count = 0
+    per_scenario = {}
+
+    for scenario in scenarios:
+        sid = scenario["id"]
+        steps = scenario["steps"]
+        recovery_keywords = scenario["recovery_keywords"]
+
+        # Build the conversation up to and including the error injection
+        conversation = ""
+        for step in steps:
+            role = step["role"]
+            content = step["content"]
+            if role == "tool":
+                # Present tool responses as system messages to the model
+                conversation += f"<|im_start|>system\n[Tool Response]: {content}<|im_end|>\n"
+            else:
+                conversation += f"<|im_start|>{role}\n{content}<|im_end|>\n"
+
+        # Prompt the model to continue after seeing the error
+        conversation += "<|im_start|>assistant\n"
+
+        input_ids = tokenizer.encode(conversation, add_special_tokens=False)
+        generated_ids = list(input_ids)
+
+        eos_tokens = {tokenizer.eos_token_id}
+        try:
+            eos_tokens.add(tokenizer.encode("<|im_end|>", add_special_tokens=False)[0])
+        except Exception:
+            pass
+
+        for _ in range(256):
+            active_x = torch.tensor(
+                [generated_ids[-model.config.block_size:]],
+                dtype=torch.long, device=device,
+            )
+            logits, _, _ = model(active_x)
+            next_tok = torch.argmax(logits[0, -1, :]).item()
+            generated_ids.append(next_tok)
+            if next_tok in eos_tokens:
+                break
+
+        completion = tokenizer.decode(
+            generated_ids[len(input_ids):], skip_special_tokens=True
+        )
+
+        # Check for self-correction behavior
+        completion_lower = completion.lower()
+        recovered = any(kw.lower() in completion_lower for kw in recovery_keywords)
+
+        if recovered:
+            recovery_count += 1
+
+        per_scenario[sid] = {
+            "recovered": recovered,
+            "completion_snippet": completion.strip()[:200],
+        }
+
+        logger.info(
+            f"  Scenario '{sid}': {'✅ RECOVERED' if recovered else '❌ NO RECOVERY'} "
+            f"| snippet: \"{completion.strip()[:80]}...\""
+        )
+
+    recovery_rate = recovery_count / len(scenarios) if scenarios else 0.0
+    logger.info(f"🏆 Error Recovery Rate: {recovery_rate * 100:.1f}%")
+
+    return {
+        "per_scenario": per_scenario,
+        "recovery_rate": recovery_rate,
+        "recovered_count": recovery_count,
+        "total_scenarios": len(scenarios),
+    }
+
+
+# ==============================================================================
 # Main Orchestrated Runner
 # ==============================================================================
 
@@ -684,6 +1122,12 @@ def main():
     # 2.1 Run Safety Red-Teaming
     safety_metrics = evaluate_safety(model, tokenizer, device=device)
     
+    # 2.2 Run Agentic Tool-Use Trace Evaluation (§2.3)
+    tool_trace_metrics = evaluate_tool_use_traces(model, tokenizer, device=device)
+    
+    # 2.3 Run Error-Injection Recovery Evaluation (§2.3)
+    error_recovery_metrics = evaluate_error_recovery(model, tokenizer, device=device)
+    
     # 3. Run Elo Arena
     if args.baseline_checkpoint_path and os.path.exists(args.baseline_checkpoint_path):
         logger.info(f"Loading baseline checkpoint state from: {args.baseline_checkpoint_path}")
@@ -715,6 +1159,8 @@ def main():
     logger.info(f"🏆 HumanEval Pass@1: {he_pass*100:.2f}%")
     logger.info(f"🏆 Safety Red-Teaming Under-Refusal Rate: {safety_metrics['under_refusal_rate']*100:.2f}%")
     logger.info(f"🏆 Safety Over-Refusal Rate: {safety_metrics['over_refusal_rate']*100:.2f}%")
+    logger.info(f"🏆 Tool-Use Trace Aggregate F1: {tool_trace_metrics['aggregate_f1']:.4f}")
+    logger.info(f"🏆 Error Recovery Rate: {error_recovery_metrics['recovery_rate']*100:.1f}%")
     logger.info(f"🏆 Consolidated Leaderboard Index: {consolidated_score*100:.2f}%")
     logger.info(f"🏆 Arena Model A Final Elo Rating: {arena_results['final_elo_a']:.1f}")
     logger.info(f"🏆 Arena Model B Final Elo Rating: {arena_results['final_elo_b']:.1f}")
@@ -736,6 +1182,15 @@ def main():
         "hellaswag_accuracy": hs_acc,
         "humaneval_pass": he_pass,
         "safety_metrics": safety_metrics,
+        "tool_trace_metrics": {
+            "aggregate_f1": tool_trace_metrics["aggregate_f1"],
+            "num_scenarios": tool_trace_metrics["num_scenarios"],
+        },
+        "error_recovery_metrics": {
+            "recovery_rate": error_recovery_metrics["recovery_rate"],
+            "recovered_count": error_recovery_metrics["recovered_count"],
+            "total_scenarios": error_recovery_metrics["total_scenarios"],
+        },
         "consolidated_score": consolidated_score,
         "arena_wins_a": arena_results["wins_a"],
         "arena_wins_b": arena_results["wins_b"],

@@ -53,6 +53,19 @@ def main():
     parser.add_argument("--model_size", type=str, default=None,
                         choices=["tiny", "1.5B-dense", "2B-dense", "2.7B-dense"],
                         help="Model preset size configuration")
+    # === Pre-training Innovation CLI flags (预训练创新特性开关) ===
+    parser.add_argument("--use_gns_adaptive", action="store_true", default=False,
+                        help="Enable GNS-Adaptive Batch Size Scheduling (自适应 Batch Size 调度)")
+    parser.add_argument("--gns_max_accum", type=int, default=16,
+                        help="Maximum grad_accum_steps under GNS adaptation")
+    parser.add_argument("--gns_check_interval", type=int, default=100,
+                        help="Steps between GNS evaluation checks")
+    parser.add_argument("--block_benchmark_leakage", action="store_true", default=False,
+                        help="Enable Semantic Fingerprint Blocking to prevent benchmark leakage (语义指纹阻断防泄露)")
+    parser.add_argument("--eval_data_dir", type=str, default="./data/eval",
+                        help="Directory containing evaluation benchmark JSONL files")
+    parser.add_argument("--use_lg_opt", action="store_true", default=False,
+                        help="Enable LG-Opt Loss-Gradient Decoupled Rescaling (Loss 偏导梯度自适应重缩放)")
     args = parser.parse_args()
 
     # 0. Initialize hardware telemetry monitor
@@ -114,6 +127,47 @@ def main():
         mode="offline" if master_process else "disabled",
         log_dir="./logs",
     )
+
+    # === Initialize Pre-training Innovation Components (初始化预训练创新组件) ===
+
+    # 1. GNS-Adaptive Batch Size Scheduling (自适应 Batch Size 调度)
+    gns_estimator = None
+    if args.use_gns_adaptive:
+        from utils.gns_estimator import GradientNoiseScaleEstimator
+        gns_estimator = GradientNoiseScaleEstimator(
+            initial_grad_accum_steps=args.grad_accum_steps,
+            max_grad_accum_steps=args.gns_max_accum,
+            check_interval=args.gns_check_interval,
+        )
+        if master_process:
+            logger.info(
+                f"📈 GNS-Adaptive enabled: initial_accum={args.grad_accum_steps}, "
+                f"max_accum={args.gns_max_accum}, check_interval={args.gns_check_interval}"
+            )
+
+    # 2. Semantic Fingerprint Blocking (语义指纹阻断防泄露)
+    leakage_blocker = None
+    if args.block_benchmark_leakage:
+        from utils.leakage_blocker import BenchmarkLeakageBlocker
+        from utils.tokenizer_loader import load_tokenizer
+        _blocker_tokenizer = load_tokenizer(fallback_model_name="gpt2")
+        leakage_blocker = BenchmarkLeakageBlocker(
+            eval_data_dir=args.eval_data_dir,
+            tokenizer=_blocker_tokenizer,
+        )
+        if master_process:
+            logger.info(
+                f"🔒 Benchmark leakage blocking enabled: "
+                f"{len(leakage_blocker.fingerprint_set):,} fingerprints loaded"
+            )
+
+    # 3. LG-Opt: Loss-Gradient Decoupled Rescaling (Loss 偏导梯度自适应重缩放)
+    lg_rescaler = None
+    if args.use_lg_opt:
+        from utils.lg_opt import LossGradientRescaler
+        lg_rescaler = LossGradientRescaler()
+        if master_process:
+            logger.info("🔧 LG-Opt Loss-Gradient Decoupled Rescaling enabled")
 
     if master_process:
         os.makedirs(args.out_dir, exist_ok=True)
@@ -363,7 +417,10 @@ def main():
             self.preload()
             return batches
 
-    prefetcher = DataPrefetcher(get_batch, "train", args.grad_accum_steps)
+    # Use dynamic grad_accum_steps: GNS may update this value at runtime
+    # 使用动态 grad_accum_steps: GNS 可能在运行时更新此值
+    current_grad_accum_steps = args.grad_accum_steps
+    prefetcher = DataPrefetcher(get_batch, "train", current_grad_accum_steps)
 
     try:
         while step < args.max_steps:
@@ -372,15 +429,27 @@ def main():
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr
 
+            # GNS may dynamically update grad_accum_steps (GNS 可能动态更新 grad_accum_steps)
+            if gns_estimator is not None:
+                new_accum = gns_estimator.current_grad_accum_steps
+                if new_accum != current_grad_accum_steps:
+                    current_grad_accum_steps = new_accum
+                    prefetcher = DataPrefetcher(get_batch, "train", current_grad_accum_steps)
+
             # Batch accumulation loop
             optimizer.zero_grad(set_to_none=True)
             loss_accum = 0.0
 
             if pp_size > 1:
                 # Slice input batch into micro-batches for 1F1B
-                x, y = get_batch("train", batch_size=args.batch_size * args.grad_accum_steps)
-                micro_batches_x = list(x.chunk(args.grad_accum_steps, dim=0))
-                micro_batches_y = list(y.chunk(args.grad_accum_steps, dim=0))
+                x, y = get_batch("train", batch_size=args.batch_size * current_grad_accum_steps)
+
+                # Apply benchmark leakage blocking (应用基准泄露阻断)
+                if leakage_blocker is not None:
+                    x, y = leakage_blocker.check_and_mask(x, y)
+
+                micro_batches_x = list(x.chunk(current_grad_accum_steps, dim=0))
+                micro_batches_y = list(y.chunk(current_grad_accum_steps, dim=0))
 
                 def loss_fn(pred_logits, targets_mb):
                     return F.cross_entropy(pred_logits.view(-1, pred_logits.size(-1)), targets_mb.view(-1), ignore_index=-100)
@@ -393,35 +462,63 @@ def main():
                         device=torch.device(device)
                     )
 
-                loss_accum = sum(l.detach().item() for l in losses) / args.grad_accum_steps if losses else 0.0
+                loss_accum = sum(l.detach().item() for l in losses) / current_grad_accum_steps if losses else 0.0
             else:
                 batches = prefetcher.next()
-                if ddp and args.grad_accum_steps > 1:
+                if ddp and current_grad_accum_steps > 1:
                     # Pre-N-1 steps: use model.no_sync() to strictly avoid any DDP communications hooks
-                    for micro_step in range(args.grad_accum_steps - 1):
+                    for micro_step in range(current_grad_accum_steps - 1):
                         x, y = batches[micro_step]
+                        # Apply benchmark leakage blocking (应用基准泄露阻断)
+                        if leakage_blocker is not None:
+                            x, y = leakage_blocker.check_and_mask(x, y)
                         with model.no_sync():
                             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
                                 logits, loss, _ = model(x, targets=y)
-                                loss = loss / args.grad_accum_steps
+                                loss = loss / current_grad_accum_steps
                             loss_accum += loss.detach().item()
                             loss.backward()
+                        # Record micro-batch gradient for GNS (记录 micro-batch 梯度用于 GNS)
+                        if gns_estimator is not None:
+                            gns_estimator.record_micro_batch_grad(model)
                     
                     # Final step: run outside no_sync to trigger All-Reduce gradient synchronization
                     x, y = batches[-1]
+                    # Apply benchmark leakage blocking (应用基准泄露阻断)
+                    if leakage_blocker is not None:
+                        x, y = leakage_blocker.check_and_mask(x, y)
                     with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
                         logits, loss, _ = model(x, targets=y)
-                        loss = loss / args.grad_accum_steps
+                        loss = loss / current_grad_accum_steps
                     loss_accum += loss.detach().item()
                     loss.backward()
+                    # Record final micro-batch gradient for GNS (记录最终 micro-batch 梯度)
+                    if gns_estimator is not None:
+                        gns_estimator.record_micro_batch_grad(model)
                 else:
-                    for micro_step in range(args.grad_accum_steps):
+                    for micro_step in range(current_grad_accum_steps):
                         x, y = batches[micro_step]
+                        # Apply benchmark leakage blocking (应用基准泄露阻断)
+                        if leakage_blocker is not None:
+                            x, y = leakage_blocker.check_and_mask(x, y)
                         with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
                             logits, loss, _ = model(x, targets=y)
-                            loss = loss / args.grad_accum_steps
+                            loss = loss / current_grad_accum_steps
                         loss_accum += loss.detach().item()
                         loss.backward()
+                        # Record micro-batch gradient for GNS (记录 micro-batch 梯度用于 GNS)
+                        if gns_estimator is not None:
+                            gns_estimator.record_micro_batch_grad(model)
+
+            # Record accumulated gradient norm for GNS before any clipping
+            # 在梯度裁剪前记录完整累积梯度范数 (用于 GNS)
+            if gns_estimator is not None:
+                gns_estimator.record_accumulated_grad(model)
+
+            # LG-Opt: rescale gradients based on loss deviation from EMA
+            # LG-Opt: 根据 loss 与 EMA 的偏差重缩放梯度
+            if lg_rescaler is not None:
+                lg_rescaler.rescale_gradients(model, loss_accum)
 
             # Clip global gradient norm
             if args.grad_clip > 0.0:
@@ -429,6 +526,11 @@ def main():
 
             # Optimization step
             optimizer.step()
+
+            # GNS step: evaluate noise scale and possibly adjust grad_accum_steps
+            # GNS 步骤: 评估噪声尺度并可能调整 grad_accum_steps
+            if gns_estimator is not None:
+                current_grad_accum_steps = gns_estimator.step(step)
 
             # Calculate time & hardware saturation metrics (MFU)
             t1 = time.time()
@@ -439,7 +541,7 @@ def main():
             mfu_percentage = calculate_mfu(
                 step_flops=step_flops,
                 elapsed_time=dt,
-                grad_accum_steps=args.grad_accum_steps,
+                grad_accum_steps=current_grad_accum_steps,
                 world_size=ddp_world_size,
                 peak_flops=312e12
             )
@@ -460,15 +562,32 @@ def main():
                 if val_loss is not None:
                     log_data["pretrain/val_loss"] = val_loss
                     logger.info(f"📊 Validation Step {step+1} | Val Loss: {val_loss:.4f}")
+
+                # Log innovation metrics (记录创新特性指标)
+                if gns_estimator is not None:
+                    log_data.update(gns_estimator.get_metrics())
+                if lg_rescaler is not None:
+                    log_data.update(lg_rescaler.get_metrics())
+                if leakage_blocker is not None and (step + 1) % 100 == 0:
+                    log_data.update(leakage_blocker.get_stats())
+
                 tracker.log(log_data, step=step)
                 telemetry_str = monitor.get_formatted_telemetry()
+
+                # Build extra status string for innovations (创新特性状态信息)
+                innovation_str = ""
+                if gns_estimator is not None:
+                    innovation_str += f" | GNS: {gns_estimator.latest_gns:.1f} | Accum: {current_grad_accum_steps}"
+                if lg_rescaler is not None:
+                    innovation_str += f" | LG-scale: {lg_rescaler.latest_scale_factor:.2f}"
+
                 logger.info(
                     f"Step {step+1}/{args.max_steps} | "
                     f"Loss: {loss_accum:.4f} | "
                     f"LR: {lr:.2e} | "
                     f"Time: {dt*1000:.1f}ms | "
                     f"MFU: {mfu_percentage:.1f}% | "
-                    f"{telemetry_str}"
+                    f"{telemetry_str}{innovation_str}"
                 )
 
                 # Print detailed ASCII telemetry cockpit every 500 steps

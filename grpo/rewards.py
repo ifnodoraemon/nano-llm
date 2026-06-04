@@ -78,6 +78,171 @@ def extract_answer(completion_text: str) -> str:
     return ""
 
 
+# ==============================================================================
+# Process-Supervised Step Rewards (PRM) & Budget-Constrained Penalties (§3.4)
+# ==============================================================================
+
+# Known tool names for logical continuity checking. Tool calls whose name
+# appears in this set (or is a reasonable snake_case identifier) receive a
+# bonus; otherwise they are treated as plausible but unverified.
+_KNOWN_TOOL_NAMES = {
+    "get_weather", "create_event", "web_search", "summarize", "read_file",
+    "write_file", "calculator", "translate", "database_query", "send_email",
+    "generate_image", "search_flights", "book_flight", "execute_code",
+    "get_stock_price", "product_search", "fetch_emails", "run_analysis",
+    "search_hotels",
+}
+
+# Regex for extracting tool_call blocks (fenced code blocks or XML tags)
+_TOOL_CALL_FENCED_RE = re.compile(r'```tool_call\s*\n(.*?)```', re.DOTALL)
+_TOOL_CALL_XML_RE = re.compile(r'<tool_call>\s*(.*?)\s*</tool_call>', re.DOTALL)
+
+
+def _extract_tool_call_blocks(completion_text: str) -> list[str]:
+    """Return raw JSON strings from all tool_call blocks in the completion."""
+    blocks = _TOOL_CALL_FENCED_RE.findall(completion_text)
+    blocks += _TOOL_CALL_XML_RE.findall(completion_text)
+    return [b.strip() for b in blocks if b.strip()]
+
+
+def compute_step_rewards(completion_text: str, gamma: float = 0.95) -> float:
+    """
+    Process-supervised step reward scorer for tool_call blocks.
+
+    For each tool_call block found in *completion_text*, assigns:
+      +0.3  if the JSON is parseable and has required 'name' + 'arguments' fields
+      +0.2  if the tool name looks logically reasonable (known name or valid identifier)
+      -0.5  if the JSON is malformed / unparseable
+
+    All step rewards are discounted by gamma^t where t is the 0-indexed step.
+
+    Args:
+        completion_text: The full completion string from the model.
+        gamma: Discount factor applied per step (default 0.95).
+
+    Returns:
+        Total discounted step reward (float).
+    """
+    blocks = _extract_tool_call_blocks(completion_text)
+    if not blocks:
+        return 0.0
+
+    total_reward = 0.0
+    for t, block in enumerate(blocks):
+        discount = gamma ** t
+        step_reward = 0.0
+
+        try:
+            data = json.loads(block)
+        except (json.JSONDecodeError, TypeError):
+            # Malformed JSON: penalise this step
+            step_reward = -0.5
+            total_reward += discount * step_reward
+            continue
+
+        # Check required fields
+        has_name = "name" in data or "tool_name" in data
+        has_args = "arguments" in data or "params" in data or "parameters" in data
+        if has_name and has_args:
+            step_reward += 0.3  # Valid format reward
+        else:
+            step_reward -= 0.5  # Missing required structure
+            total_reward += discount * step_reward
+            continue
+
+        # Logical continuity: check tool name reasonableness
+        tool_name = str(data.get("name", data.get("tool_name", ""))).lower().strip()
+        if tool_name in _KNOWN_TOOL_NAMES:
+            step_reward += 0.2  # Known tool
+        elif re.match(r'^[a-z][a-z0-9_]{1,40}$', tool_name):
+            step_reward += 0.1  # Plausible snake_case identifier (partial credit)
+
+        total_reward += discount * step_reward
+
+    return total_reward
+
+
+def compute_budget_penalty(
+    completion_text: str,
+    max_steps: int = 5,
+    max_tokens: int = 1500,
+) -> float:
+    """
+    Budget-constrained penalty for tool_call usage.
+
+    Penalties:
+      -3.0  if the number of tool_call invocations exceeds *max_steps*
+      -1.5  if the character-estimated token count exceeds *max_tokens*
+      -5.0  if an infinite loop is detected (3+ consecutive near-identical calls)
+       0.0  otherwise
+
+    Only the **first** triggered penalty is returned (most severe first).
+
+    Args:
+        completion_text: The full completion string.
+        max_steps: Maximum allowed tool_call invocations.
+        max_tokens: Maximum allowed token-equivalent length.
+
+    Returns:
+        Penalty value (float, <= 0).
+    """
+    blocks = _extract_tool_call_blocks(completion_text)
+    num_calls = len(blocks)
+
+    # Check infinite loop: 3+ consecutive near-identical tool calls
+    if num_calls >= 3:
+        for i in range(num_calls - 2):
+            b1, b2, b3 = blocks[i], blocks[i + 1], blocks[i + 2]
+            # Near-identical: strip whitespace and compare
+            if _blocks_near_identical(b1, b2) and _blocks_near_identical(b2, b3):
+                return -5.0
+
+    # Check step count budget
+    if num_calls > max_steps:
+        return -3.0
+
+    # Check token budget (approximate: 1 token ≈ 4 chars for English text)
+    estimated_tokens = len(completion_text) // 4
+    if estimated_tokens > max_tokens:
+        return -1.5
+
+    return 0.0
+
+
+def _blocks_near_identical(a: str, b: str) -> bool:
+    """
+    Returns True if two tool_call block strings are near-identical.
+    Uses JSON-level structural comparison: same tool name AND same argument
+    keys AND same argument values. Falls back to whitespace-normalized exact
+    match for non-JSON blocks.
+
+    判断两个 tool_call 块是否近似相同.
+    使用 JSON 级结构比较: 相同工具名 + 相同参数键 + 相同参数值.
+    """
+    a_clean = re.sub(r'\s+', '', a)
+    b_clean = re.sub(r'\s+', '', b)
+    if a_clean == b_clean:
+        return True
+    # Try JSON-level comparison (JSON 级比较)
+    try:
+        da = json.loads(a.strip())
+        db = json.loads(b.strip())
+        name_a = str(da.get("name", da.get("tool_name", ""))).lower()
+        name_b = str(db.get("name", db.get("tool_name", ""))).lower()
+        if not name_a and not name_b:
+            return False  # Neither has tool name — not a valid tool_call comparison
+        args_a = da.get("arguments", da.get("params", {}))
+        args_b = db.get("arguments", db.get("params", {}))
+        if isinstance(args_a, str):
+            args_a = json.loads(args_a)
+        if isinstance(args_b, str):
+            args_b = json.loads(args_b)
+        return name_a == name_b and args_a == args_b
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        pass
+    return False
+
+
 def evaluate_completion_rewards(*args, **kwargs):
     """
     Calculates rewards for a group of completions.
@@ -232,6 +397,14 @@ def evaluate_completion_rewards(*args, **kwargs):
         # G. Add LLM-as-a-Judge Reward (scale normalized [0.2, 1.0] to [0.4, 2.0])
         judge_score = judge_scores[idx].item()
         reward += judge_score * 2.0
+
+        # H. Process-Supervised Step Rewards (PRM) for tool_call blocks (§3.4)
+        step_reward = compute_step_rewards(completion)
+        reward += step_reward
+
+        # I. Budget-Constrained Penalty for tool_call usage (§3.4)
+        budget_penalty = compute_budget_penalty(completion)
+        reward += budget_penalty
         
         rewards.append(reward)
         
